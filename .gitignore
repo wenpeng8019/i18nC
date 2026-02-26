@@ -1,0 +1,16 @@
+.DS_Store
+*.log
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*.tmp
+*.cache
+*.out
+
+# Debug mode output (i18n.sh --debug saves temp files here)
+debug/
+
+# Generated compile database (may be created in project root by bear)
+compile_commands.json
