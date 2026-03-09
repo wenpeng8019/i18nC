@@ -6,34 +6,31 @@
 
 ## 总体流程
 
-提取管线分八个阶段：
+提取管线分七个阶段：
 
 ```
 源文件 .c / .h
         │
         ▼
-[1] Marker 注入    →  临时 _marker_h   （将 LA_W/S/F 重定义为哨兵标记）
+[1] Marker 注入    →  临时 _marker_h   （将 LA_W/S/F 重定义为含 SID 的哨兵标记）
         │
         ▼
 [2] cc -E 预处理   →  宏展开后的文本   （所有 #include 递归展开）
         │
         ▼
-[3] awk 字符串解析 →  W|key|str|file  /  S|key|str|file  /  F|key|str|file
+[3] awk 字符串解析 →  W|key|str|file|sid  （字符串 + SID 统一从预处理输出提取）
         │
         ▼
-[4] 去重 + 排序    →  TEMP_WORDS / TEMP_FORMATS / TEMP_STRINGS
+[4] 去重 + 排序    →  TEMP_WORDS / TEMP_FORMATS / TEMP_STRINGS （携带 SID）
         │
         ▼
-[5] SID 扫描 + 分配  →  TEMP_EXISTING_SIDS（旧 SID）/ 新 SID 自 .i18n 分配
+[5] SID 分配 + 代码生成 →  .LANG.h  /  .LANG.c（含 SID）/  lang.en
         │
         ▼
-[6] 代码生成       →  .LANG.h  /  .LANG.c（含 SID）/  lang.en
+[6] 源码回写       →  LA_W("str", 0) → LA_W("str", LA_W3, 5)
         │
         ▼
-[7] 源码回写       →  LA_W("str", 0) → LA_W("str", LA_W3, 5)
-        │
-        ▼
-[8] 保存 .i18n     →  SID_NEXT=N
+[7] 保存 .i18n     →  SID_NEXT=N
 ```
 
 ---
@@ -42,22 +39,26 @@
 
 核心思路：**不自己解析 C 语法，而是让 C 预处理器代劳**，再从输出中识别已知哨兵标记。
 
-临时头文件（`_marker_h`）将宏重定义为在字符串两侧插入唯一哨兵：
+临时头文件（`_marker_h`）将宏重定义为在字符串两侧插入哨兵标记，
+**并通过 `_I18NSID_` 分隔符将 SID 嵌入预处理输出**：
 
 ```c
 // 通过 cc -E -P -include _marker_h source.c 注入
 
-#undef LA_W
-#define LA_W(WD, ID, ...)  _I18NW_  WD  _I18NW_END_
-
-#undef LA_S
-#define LA_S(STR, ID, ...) _I18NS_  STR  _I18NS_END_
-
-#undef LA_F
-#define LA_F(FMT, ...)     _I18NF_  FMT  _I18NF_END_
+#ifndef LA_W
+#define LA_W(WD, ID, SID)      _I18NW_  WD  _I18NSID_ SID  _I18NW_END_
+#endif
+#ifndef LA_S
+#define LA_S(STR, ID, SID)     _I18NS_  STR _I18NSID_ SID  _I18NS_END_
+#endif
+#ifndef LA_F
+#define LA_F(FMT, ID, SID, ...) _I18NF_ FMT _I18NSID_ SID  _I18NF_END_
+#endif
 ```
 
-`LA_W` / `LA_S` 采用 `...` 吸收第三参数 SID，使当源文件带着 SID 第三参数时也能正常预处理。
+SID 作为纯数字常量，在 `cc -E` 展开后原样保留在输出中，
+使提取器能从同一条预处理输出中同时获得字符串内容和其 SID——
+不再需要单独扫描原始源码来提取 SID（旧方案的一致性问题根源）。
 
 这样做的好处：
 - 宏参数中的**相邻字符串拼接**由预处理器自动处理
@@ -87,14 +88,16 @@ printf(LA_S("Connection to " SERVER_NAME " failed", LA_S0), ...);
 经 `cc -E -P` 处理后：
 
 ```
-printf( _I18NS_  "Connection to " "myserver" " failed"  _I18NS_END_ , ...);
+printf( _I18NS_  "Connection to " "myserver" " failed"  _I18NSID_ 12  _I18NS_END_ , ...);
 ```
 
 预处理器完成了：
 - 将 `SERVER_NAME` 替换为其定义
 - 保留相邻字符串字面量为独立 token（尚未合并）
+- 将 SID（第三参数 `12`）展开为 `_I18NSID_ 12`，嵌入输出
 
-哨兵 `_I18NS_` 标记区域起点，`_I18NS_END_` 标记区域终点。
+哨兵 `_I18NS_` 标记区域起点，`_I18NSID_` 分隔字符串与 SID，
+`_I18NS_END_` 标记区域终点。
 
 ---
 
@@ -109,13 +112,19 @@ awk 提取器将整个预处理输出作为一个文本块处理。
         │
         ▼
 进入"收集"模式
-循环直到 _I18N[WSF]_END_：
+提取 _I18N[WSF]_ ... _I18NSID_ 之间的内容作为字符串片段
+提取 _I18NSID_ ... _I18N[WSF]_END_ 之间的内容作为 SID
+        │
+        ▼
+对字符串片段：
     找下一个 '"' token
     逐字符读取直到闭合 '"'（处理 \" 和 \\）
     拼接到当前字符串
+    统计字面量个数 nlit
         │
         ▼
-输出：TYPE|key|str|源文件名
+nlit > 1（宏拼接如 PRIu64）→ 跳过该条目
+nlit = 1 → 输出：TYPE|key|str|源文件名|sid
 ```
 
 **字符串前缀处理：**  
@@ -125,6 +134,15 @@ awk 提取器将整个预处理输出作为一个文本块处理。
 **相邻字符串字面量拼接：**  
 同一 Marker 区域内的多个引号片段按顺序拼接：
 `"hello " "world"` → `hello world`。
+
+**多段字符串字面量检测（PRIu64 等宏拼接）：**
+
+当 `nlit > 1`（即同一区域内出现多个独立的字符串字面量）时，
+说明涉及 C 宏拼接（如 `"timeout %" PRIu64 " ms"`，`PRIu64` 被预处理器展开为 `"ll" "u"`）。
+这类字符串包含平台相关的格式说明符，不适合国际化追踪，因此被直接跳过。
+
+源码回写阶段也会检测这种模式，将其 ID 和 SID 强制重置为 `0, 0`，
+使 `LA_F` 在运行时直接使用字面量（正确行为）。
 
 ---
 
@@ -164,51 +182,66 @@ Key = `str`（完全匹配）
 
 ---
 
-## 阶段 5 — SID 扫描与分配
+## 阶段 5 — SID 分配与代码生成
 
 SID（Serial ID）是每个字符串条目的唯一持久编号，写入源文件作为 `LA_*` 第三参数。
 
 SID 的作用：
-- 跨版本跟踪字符串变更（-- import 变更检测的基础）
+- 跨版本跟踪字符串变更（--import 变更检测的基础）
 - LA_Wn ID 可能因新增/删除条目而重新分配，SID 不会变，其对应的译文也就不会丢失
+
+### SID 提取方式（SID-in-marker 架构）
+
+SID 在阶段 1 通过 `_I18NSID_` 分隔符嵌入预处理输出，
+在阶段 3 与字符串一起从 `cc -E` 输出中提取。
+聚合后的数据格式为五列：`TYPE|key|str|file|sid`。
+
+**不再需要单独扫描原始源码来获取 SID**——
+旧方案中从原始源码正则提取 SID 时，
+`PRIu64` 等宏拼接的多段字符串会导致 key 不一致
+（预处理输出与原始源码中的字符串形态不同），
+造成 SID 每次运行都重新分配（"SID 漂移"）。
 
 ### .i18n 持久化文件
 
 格式：`SID_NEXT=N`，每次运行后自动更新
 位置：与源码目录同层（各子目录独立）
 
-### 扫描 + 分配逻辑
+### 分配逻辑
 
 ```
-1. 扫描源文件中现有 LA_X(str, id, SID) 的第三参数
-   → 建立 TEMP_EXISTING_SIDS： type|key|SID
+1. 从阶段 4 的聚合结果中读取每个条目的已有 SID（第 5 列）
 
-2. 对字面量生成 TEMP_WORDS/STRINGS/FORMATS 后，为每个条目分配 SID：
-   - 可从 TEMP_EXISTING_SIDS 查到已有 SID → 居用
-   - 查不到（新条目） → SID_NEXT 自增，写入 TEMP_MAP（字段 4）
+2. 为每个条目分配 SID：
+   - 已有 SID > 0 → 沿用
+   - 无已有 SID（新条目）→ SID_NEXT 自增
 
 3. 如果 .i18n 不存在（I18N_REINIT=1）：
-   - 跳过 TEMP_EXISTING_SIDS 查找，全量从 1 重新分配
+   - 忽略已有 SID，全量从 1 重新分配
    - 确保 SID 不被旧数据干扰
    - 如果已有 LANG.SUFFIX.h，备份到 .bak
 
-4. 运行结束： SID_NEXT 取与现有最大 SID+1 的较大值，写入 .i18n
+4. 运行结束：max_sid = max(所有已分配 SID)
+   如 max_sid >= SID_NEXT ，推高 SID_NEXT = max_sid + 1
+   写入 .i18n
 ```
 
-### TEMP_MAP 格式（四列）
+### --ndebug 双模式
 
-```
-type | key | id_name | SID
-  W  | connected | LA_W2 | 3
-  S  | connection failed | LA_S0 | 12
-  F  | port %d open\n | LA_F0 | 33
-```
+SID 分配后，枚举 ID 名称的生成策略取决于运行模式：
 
----
+| 模式 | id_name 规则 | 枚举排列 | 数组布局 |
+|---|---|---|---|
+| 默认 (Debug) | `LA_{T}{SID}`（如 `LA_W5`） | 按 SID 顺序，空洞用 `_LA_N` 占位符填充 | 可能有空洞（lang_str 对 NULL 返回 ""） |
+| `--ndebug` (Release) | `LA_{T}{seq}`（如 `LA_W0`） | 按类型分组连续编号 | 紧凑无空洞 |
 
-## 阶段 6 — 代码生成
+两种模式共用同一套 SID 追踪系统（`.i18n` 文件）。
+Debug 模式下增删条目不影响已有项的 ID 值（减少 diff 噪音）；
+`--ndebug` 模式下每次运行都可能重新分配 ID（追求最小内存占用）。
 
-### .LANG.h
+### 代码生成
+
+#### .LANG.h
 
 输出一个匿名枚举，包含三段连续的块：
 
@@ -245,7 +278,7 @@ LA_NUM
 
 ---
 
-## 阶段 7 — 源码回写
+## 阶段 6 — 源码回写
 
 生成枚举后，提取器将源目录下所有 `.c` 和 `.h` 文件中的
 `LA_*(str, 占位符)` 调用替换为正确的 `LA_*(str, LA_Xn, SID)`。
@@ -263,6 +296,12 @@ LA_NUM
 结果写入临时文件，再通过 `mv` 覆盖原文件。
 若 awk 失败，原文件不会被修改。
 
+**多段字符串字面量清理：**
+
+回写前先检测含宏拼接的调用（如 `LA_F("..." PRIu64 "...", ...)`），
+将其 ID 和 SID 强制重置为 `0, 0`。
+这确保不可追踪的字符串不会残留旧的 ID 值。
+
 #### 为什么不用正则表达式？
 
 朴素的正则如 `s/LA_W("...", \w+)/LA_W("...", LA_W3, 5)/` 在以下情况会失败：
@@ -271,6 +310,9 @@ LA_NUM
 - 字符串内有转义引号
 
 字符扫描器能正确处理所有这些情况。
+
+PowerShell 版本的源码回写使用 `[Regex]::Replace` + `[MatchEvaluator]`，
+先通过正则处理多段字符串清理，再用三个分类正则（W/S/F）替换标准调用。
 
 ---
 
@@ -346,12 +388,11 @@ awk 解析器：
 
 ```
 i18n/debug/
-├── all.txt             # 提取器原始输出（W|key|str|file，每行一条）
-├── words.txt           # 去重 + 排序后的 LA_W 条目
-├── formats.txt         # 去重 + 排序后的 LA_F 条目
-├── strings.txt         # 去重 + 排序后的 LA_S 条目
+├── all.txt             # 提取器原始输出（W|key|str|file|sid，每行一条）
+├── words.txt           # 去重 + 排序后的 LA_W 条目（含 SID）
+├── formats.txt         # 去重 + 排序后的 LA_F 条目（含 SID）
+├── strings.txt         # 去重 + 排序后的 LA_S 条目（含 SID）
 ├── map.txt             # W|key|LA_Wn|SID …（四列 TEMP_MAP）
-├── existing_sids.txt   # 提取自源码第三参数的现有 SID： type|key|SID
 ├── old_sid_map.txt     # 解析自旧 .LANG.c： SID|英文内容
 └── old_import_map.txt  # 解析自旧 LANG.SUFFIX.h： SID|旧译文
 ```

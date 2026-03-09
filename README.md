@@ -96,9 +96,35 @@ lang_load_fp(fopen("lang.zh", "r"));       // optionally load a translation
 ./i18n/i18n.sh <source_dir> [options]
 
 选项：
+  --ndebug          紧凑模式（Release 构建），连续编号，无空洞
   --export          同时输出 lang.en（翻译模板）
   --import SUFFIX   生成/更新 LANG.SUFFIX.h（保留已有译文，标记新增与变更条目）
   --debug           将所有中间临时文件保存到 ./i18n/debug/ 以供排查
+```
+
+### --ndebug 双模式
+
+提取工具支持两种 ID 编号策略，通过 `--ndebug` 选项切换：
+
+| 模式 | 枚举风格 | 数组布局 | 适用场景 |
+|---|---|---|---|
+| 默认 (Debug) | `LA_W5`, `LA_S26`, `LA_F96`（基于 SID） | 按 SID 排列，空洞用占位符 `_LA_N` 填充 | 开发期：增删条目不影响已有 ID，减少 diff 噪音 |
+| `--ndebug` (Release) | `LA_W0`~`Wn`, `LA_S0`~`Sn`, `LA_F0`~`Fn`（连续） | 按类型分组紧凑排列，无空洞 | 发布构建：最小化内存占用 |
+
+两种模式共用相同的 SID 追踪系统（`.i18n` 文件），切换无需重新初始化。
+
+**CMake 集成示例**（根据构建类型自动选择模式）：
+
+```cmake
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+    set(I18N_NDEBUG_FLAG "--ndebug")
+else()
+    set(I18N_NDEBUG_FLAG "")
+endif()
+
+add_custom_target(i18n_gen
+    COMMAND bash ${PROJECT_SOURCE_DIR}/i18n/i18n.sh ${SOURCE_DIR} ${I18N_NDEBUG_FLAG}
+)
 ```
 
 ### --export / --import 翻译工作流
