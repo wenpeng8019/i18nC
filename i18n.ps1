@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     当系统无 WSL / Git Bash / MSYS2 时由 i18n.bat 调用。
-    支持与 i18n.sh 相同的全部选项（--export / --import / --debug）。
+    支持与 i18n.sh 相同的全部选项（--ndebug / --export / --import / --debug）。
     编译器检测顺序：compile_commands.json 中指定 -> cl.exe -> gcc.exe -> clang.exe
 
 .EXAMPLE
@@ -24,6 +24,7 @@ $ErrorActionPreference = 'Stop'
 $SourceDir    = ""
 $ExportMode   = $false
 $ImportSuffix = ""
+$NdebugMode   = $false
 $DebugMode    = $false
 
 $i = 0
@@ -32,6 +33,7 @@ while ($i -lt $args.Count) {
     switch ($a) {
         "--export"  { $ExportMode = $true }
         "--import"  { $i++; $ImportSuffix = $args[$i] }
+        "--ndebug"  { $NdebugMode = $true }
         "--debug"   { $DebugMode = $true }
         default {
             if ($SourceDir -eq "") { $SourceDir = $a }
@@ -42,9 +44,10 @@ while ($i -lt $args.Count) {
 }
 
 if ($SourceDir -eq "") {
-    Write-Host "Usage: i18n.ps1 <source_dir> [--export] [--import SUFFIX] [--debug]"
+    Write-Host "Usage: i18n.ps1 <source_dir> [--ndebug] [--export] [--import SUFFIX] [--debug]"
     Write-Host "Example: i18n.ps1 p2p_ping"
     Write-Host "Options:"
+    Write-Host "  --ndebug          Generate compact sequential IDs (release mode)"
     Write-Host "  --export          Export lang.en template file for translations"
     Write-Host "  --import SUFFIX   Generate LANG.SUFFIX.h with embedded language table"
     Write-Host "  --debug           Keep temp files in .\i18n\debug\ for inspection"
@@ -61,6 +64,20 @@ $SourceDir = $SourceDir.TrimEnd('\', '/')
 $OutputH   = Join-Path $SourceDir ".LANG.h"
 $OutputC   = Join-Path $SourceDir ".LANG.c"
 $UserLangH = Join-Path $SourceDir "LANG.h"
+
+# 加载/初始化持久化 SID 计数器（与 .LANG.c 同目录的 .i18n 文件）
+# 若 .i18n 不存在则全量重新初始化（所有条目重新从 1 分配 SID）
+$I18NFile   = Join-Path $SourceDir ".i18n"
+$SidNext    = 1
+$I18NReinit = $false
+if (Test-Path $I18NFile) {
+    $i18nContent = Get-Content $I18NFile -Raw -ErrorAction SilentlyContinue
+    if ($i18nContent -match '(?m)^SID_NEXT=(\d+)') { $SidNext = [int]$Matches[1] }
+} else {
+    $I18NReinit = $true
+    Write-Host "Note: $I18NFile not found — reinitializing all SIDs from 1"
+}
+$SidNextStart = $SidNext
 
 if (-not (Test-Path $SourceDir -PathType Container)) {
     Write-Error "Error: Directory not found: $SourceDir"
@@ -292,13 +309,13 @@ function Get-CompilerFlagsForFile {
 
 $markerContent = @'
 #ifndef LA_W
-#define LA_W(WD, ID) _I18NW_ WD _I18NW_END_
+#define LA_W(WD, ID, SID) _I18NW_ WD _I18NSID_ SID _I18NW_END_
 #endif
 #ifndef LA_S
-#define LA_S(STR, ID) _I18NS_ STR _I18NS_END_
+#define LA_S(STR, ID, SID) _I18NS_ STR _I18NSID_ SID _I18NS_END_
 #endif
 #ifndef LA_F
-#define LA_F(FMT, ...) _I18NF_ FMT _I18NF_END_
+#define LA_F(FMT, ID, SID, ...) _I18NF_ FMT _I18NSID_ SID _I18NF_END_
 #endif
 '@
 [System.IO.File]::WriteAllText($TempMarkerH, $markerContent, [System.Text.UTF8Encoding]::new($false))
@@ -370,9 +387,20 @@ function Extract-Strings {
         $fragment = $Content.Substring($pos, $endIdx - $pos)
         $pos      = $endIdx + $endPat.Length
 
+        # 在 fragment 中分离字符串部分和 SID 部分
+        # 格式: <strings> _I18NSID_ <sid> （SID 由 marker 宏从源码透传）
+        $esid = 0
+        $sidMarkerIdx = $fragment.IndexOf('_I18NSID_')
+        if ($sidMarkerIdx -ge 0) {
+            $sidStr = $fragment.Substring($sidMarkerIdx + 9).Trim()
+            if ($sidStr -match '^\d+') { $esid = [int]$Matches[0] }
+            $fragment = $fragment.Substring(0, $sidMarkerIdx)
+        }
+
         # 提取并拼接 fragment 中所有字符串字面量
         # 支持：普通 "..." / L"..." / u"..." / U"..." / u8"..."
         $sb   = [System.Text.StringBuilder]::new()
+        $nlit = 0   # 统计字符串字面量个数（>1 = 宏拼接，如 PRIu64）
         $fpos = 0
         $flen = $fragment.Length
 
@@ -393,6 +421,7 @@ function Extract-Strings {
             }
 
             if ($c1 -eq [char]'"') {
+                $nlit++
                 $fpos++
                 while ($fpos -lt $flen) {
                     $c2 = $fragment[$fpos]
@@ -412,19 +441,20 @@ function Extract-Strings {
             }
         }
 
-        $str = $sb.ToString()
+        # 多段字符串字面量 = 含宏拼接（如 PRIu64），无法通过原始源码追踪 SID，跳过
+        if ($nlit -gt 1) { $sb.Clear(); $str = '' } else { $str = $sb.ToString() }
         if ($str -ne '') {
             switch ($tp) {
                 'W' {
                     $key = $str.Trim().ToLower()
-                    $results.Add("W|$key|$str|$Base")
+                    $results.Add("W|$key|$str|$Base|$esid")
                 }
                 'S' {
                     $key = $str.ToLower()
-                    $results.Add("S|$key|$str|$Base")
+                    $results.Add("S|$key|$str|$Base|$esid")
                 }
                 'F' {
-                    $results.Add("F|$str|$str|$Base")
+                    $results.Add("F|$str|$str|$Base|$esid")
                 }
             }
         }
@@ -462,6 +492,7 @@ Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
     }
 
 [System.IO.File]::WriteAllLines($TempAll, $allResults, [System.Text.UTF8Encoding]::new($false))
+
 
 # ============================================================================
 # 分类、去重、排序辅助函数
@@ -506,24 +537,28 @@ function Aggregate-ByType {
     $seen  = [ordered]@{}
     $strs  = @{}
     $files = @{}
+    $sids  = @{}
     foreach ($line in $filtered) {
-        $parts = $line -split '\|', 4
+        $parts = $line -split '\|', 5
         $key  = $parts[1]
         $str  = $parts[2]
         $file = $parts[3]
+        $sid  = if ($parts.Count -ge 5) { [int]$parts[4] } else { 0 }
         if ($seen.Contains($key)) {
             if ($files[$key].IndexOf($file) -lt 0) {
                 $files[$key] += ",$file"
             }
+            if ($sids[$key] -le 0 -and $sid -gt 0) { $sids[$key] = $sid }
         } else {
             $seen[$key]  = $true
             $strs[$key]  = $str
             $files[$key] = $file
+            $sids[$key]  = $sid
         }
     }
     return $seen.Keys | Sort-Object | ForEach-Object {
         $k = $_
-        "${Type}|$k|$($strs[$k])|$($files[$k])"
+        "${Type}|$k|$($strs[$k])|$($files[$k])|$($sids[$k])"
     }
 }
 
@@ -560,8 +595,10 @@ if ($total -eq 0) {
 # 生成 .LANG.h
 # ============================================================================
 
-$map = @{}   # "W|key" -> "LA_W0" etc.
-$sid = 0
+$map    = @{}   # "W|key" -> id_name (e.g. "LA_W0" or "LA_W{sid}")
+$mapSid = @{}   # "W|key" -> SID number
+$sid    = 0
+$maxSid = 0
 
 $hLines = [System.Collections.Generic.List[string]]::new()
 $hLines.Add("/*")
@@ -581,66 +618,109 @@ $hLines.Add("enum {")
 $hLines.Add("    LA_PRED = LA_PREDEFINED,  /* 基础 ID，后续 ID 从此开始递增 */")
 $hLines.Add("")
 
-# Words
-if ($wordCount -gt 0) {
-    $hLines.Add("    /* Words (LA_W) */")
-    $wid = 0
+# --- Phase 1: SID 分配 + map 建立（两种模式共用） ---
+
+# 辅助：分配 SID 并填充 map/mapSid
+function Alloc-Entry {
+    param([string]$Type, [string]$Key, [int]$SeqIdx, [int]$ExistingSid = 0)
+    $entrySid = 0
+    if (-not $I18NReinit -and $ExistingSid -gt 0) { $entrySid = $ExistingSid }
+    if ($entrySid -le 0) { $entrySid = $script:SidNext; $script:SidNext++ }
+    if ($NdebugMode) {
+        $idName = "LA_${Type}${SeqIdx}"
+    } else {
+        $idName = "LA_${Type}${entrySid}"
+    }
+    $script:map["${Type}|${Key}"]    = $idName
+    $script:mapSid["${Type}|${Key}"] = $entrySid
+    if ($entrySid -gt $script:maxSid) { $script:maxSid = $entrySid }
+    $script:sid++
+    return @{ IdName = $idName; Sid = $entrySid }
+}
+
+# 收集所有条目的 enum 数据（SID 顺序索引用）
+$enumData = @{}   # SID -> @{Type; IdName; Str; Files; Params}
+
+$wSeq = 0
+foreach ($line in $wordLines) {
+    $parts = $line -split '\|', 5
+    $eSid = if ($parts.Count -ge 5) { [int]$parts[4] } else { 0 }
+    $r = Alloc-Entry -Type "W" -Key $parts[1] -SeqIdx $wSeq -ExistingSid $eSid
+    $enumData[$r.Sid] = @{ Type = "W"; IdName = $r.IdName; Str = $parts[2]; Files = ($parts[3] -replace ',', ', '); Params = "" }
+    $wSeq++
+}
+$sSeq = 0
+foreach ($line in $stringLines) {
+    $parts = $line -split '\|', 5
+    $eSid = if ($parts.Count -ge 5) { [int]$parts[4] } else { 0 }
+    $r = Alloc-Entry -Type "S" -Key $parts[1] -SeqIdx $sSeq -ExistingSid $eSid
+    $enumData[$r.Sid] = @{ Type = "S"; IdName = $r.IdName; Str = $parts[2]; Files = ($parts[3] -replace ',', ', '); Params = "" }
+    $sSeq++
+}
+$fSeq = 0; $firstFmtId = ""
+foreach ($line in $formatLines) {
+    $parts = $line -split '\|', 5
+    $eSid = if ($parts.Count -ge 5) { [int]$parts[4] } else { 0 }
+    $r = Alloc-Entry -Type "F" -Key $parts[1] -SeqIdx $fSeq -ExistingSid $eSid
+    $params = ([regex]::Matches($parts[2], '%[sdifuxXclu]') | ForEach-Object { $_.Value }) -join ','
+    $enumData[$r.Sid] = @{ Type = "F"; IdName = $r.IdName; Str = $parts[2]; Files = ($parts[3] -replace ',', ', '); Params = $params }
+    if ($firstFmtId -eq "") { $firstFmtId = $r.IdName }
+    $fSeq++
+}
+
+# --- Phase 2: 生成 enum ---
+
+if ($NdebugMode) {
+    # --ndebug: 按类型分组连续编号（紧凑模式）
+    $curType = ""
     foreach ($line in $wordLines) {
-        $parts = $line -split '\|', 4
-        $str   = $parts[2]
-        $files = $parts[3] -replace ',', ', '
-        $idName = "LA_W$wid"
+        $parts = $line -split '\|', 5; $key = $parts[1]; $str = $parts[2]; $files = $parts[3] -replace ',', ', '
+        $idName = $map["W|$key"]
+        if ($curType -ne "W") { $hLines.Add("    /* Words (LA_W) */"); $curType = "W" }
         $hLines.Add("    $idName,  /* `"$str`"  [$files] */")
-        $map["W|$($parts[1])"] = $idName
-        $wid++; $sid++
     }
-    $hLines.Add("")
-}
-
-# Strings
-if ($stringCount -gt 0) {
-    $hLines.Add("    /* Strings (LA_S) */")
-    $strid = 0
+    if ($wordCount -gt 0) { $hLines.Add("") }
+    $curType = ""
     foreach ($line in $stringLines) {
-        $parts = $line -split '\|', 4
-        $str   = $parts[2]
-        $files = $parts[3] -replace ',', ', '
-        $idName = "LA_S$strid"
+        $parts = $line -split '\|', 5; $key = $parts[1]; $str = $parts[2]; $files = $parts[3] -replace ',', ', '
+        $idName = $map["S|$key"]
+        if ($curType -ne "S") { $hLines.Add("    /* Strings (LA_S) */"); $curType = "S" }
         $hLines.Add("    $idName,  /* `"$str`"  [$files] */")
-        $map["S|$($parts[1])"] = $idName
-        $strid++; $sid++
     }
-    $hLines.Add("")
-}
-
-# Formats
-if ($formatCount -gt 0) {
-    $hLines.Add("    /* Formats (LA_F) - Format strings for validation */")
-    $fid = 0
+    if ($stringCount -gt 0) { $hLines.Add("") }
+    $curType = ""
     foreach ($line in $formatLines) {
-        $parts = $line -split '\|', 4
-        $str   = $parts[2]
-        $files = $parts[3] -replace ',', ', '
-        $idName = "LA_F$fid"
-        # 提取格式参数列表
-        $params = ([regex]::Matches($str, '%[sdifuxXclu]') | ForEach-Object { $_.Value }) -join ','
-        if ($params) {
-            $hLines.Add("    $idName,  /* `"$str`" ($params)  [$files] */")
+        $parts = $line -split '\|', 5; $key = $parts[1]; $str = $parts[2]; $files = $parts[3] -replace ',', ', '
+        $idName = $map["F|$key"]; $eSid = $mapSid["F|$key"]
+        $params = $enumData[$eSid].Params
+        if ($curType -ne "F") { $hLines.Add("    /* Formats (LA_F) */"); $curType = "F" }
+        if ($params) { $hLines.Add("    $idName,  /* `"$str`" ($params)  [$files] */") }
+        else         { $hLines.Add("    $idName,  /* `"$str`"  [$files] */") }
+    }
+    if ($formatCount -gt 0) { $hLines.Add("") }
+} else {
+    # Debug: 按 SID 顺序排列，空洞用占位符填充
+    for ($s = 1; $s -le $maxSid; $s++) {
+        if ($enumData.ContainsKey($s)) {
+            $e = $enumData[$s]
+            if ($e.Type -eq "F" -and $e.Params -ne "") {
+                $hLines.Add("    $($e.IdName),  /* `"$($e.Str)`" ($($e.Params))  [$($e.Files)] */")
+            } else {
+                $hLines.Add("    $($e.IdName),  /* `"$($e.Str)`"  [$($e.Files)] */")
+            }
         } else {
-            $hLines.Add("    $idName,  /* `"$str`"  [$files] */")
+            $hLines.Add("    _LA_$s,")
         }
-        $map["F|$str"] = $idName
-        $fid++; $sid++
     }
     $hLines.Add("")
 }
 
-$hLines.Add("    LA_NUM = $sid")
+$hLines.Add("    LA_NUM")
 $hLines.Add("};")
 $hLines.Add("")
 if ($formatCount -gt 0) {
     $hLines.Add("/* 格式字符串起始位置（用于验证） */")
-    $hLines.Add("#define LA_FMT_START LA_F0")
+    $hLines.Add("#define LA_FMT_START $firstFmtId")
 } else {
     $hLines.Add("/* 无格式字符串 */")
     $hLines.Add("#define LA_FMT_START LA_NUM")
@@ -657,6 +737,17 @@ $hLines.Add("#endif /* LANG_H__ */")
 # 生成 .LANG.c
 # ============================================================================
 
+# 从旧 .LANG.c 提取 SID→字符串映射（变更检测用，必须在覆写前完成）
+$oldSidMap = @{}   # SID → en_string
+if (Test-Path $OutputC) {
+    Get-Content $OutputC | ForEach-Object {
+        if ($_ -match '\[LA_[WSF]\d+\]\s*=\s*"((?:[^"\\]|\\.)*)",\s*/\*\s*SID:(\d+)') {
+            $val = $Matches[1]; $s2 = [int]$Matches[2]
+            if ($s2 -gt 0 -and -not $oldSidMap.ContainsKey($s2)) { $oldSidMap[$s2] = $val }
+        }
+    }
+}
+
 $cLines = [System.Collections.Generic.List[string]]::new()
 $cLines.Add("/*")
 $cLines.Add(" * Auto-generated language strings")
@@ -668,25 +759,31 @@ $cLines.Add("/* 字符串表 */")
 $cLines.Add("const char* lang_en[LA_NUM] = {")
 
 function Escape-CString([string]$s) {
-    return $s.Replace('\', '\\').Replace('"', '\"')
+    return $s.Replace('"', '\"')
 }
 
 $wid = 0
 foreach ($line in $wordLines) {
-    $str = ($line -split '\|', 4)[2]
-    $cLines.Add("    [LA_W$wid] = `"$(Escape-CString $str)`",")
+    $parts = $line -split '\|', 4; $str = $parts[2]; $key = $parts[1]
+    $idName = if ($map.ContainsKey("W|$key")) { $map["W|$key"] } else { "LA_W$wid" }
+    $eSid = if ($mapSid.ContainsKey("W|$key")) { $mapSid["W|$key"] } else { 0 }
+    $cLines.Add("    [$idName] = `"$(Escape-CString $str)`",  /* SID:$eSid */")
     $wid++
 }
 $strid = 0
 foreach ($line in $stringLines) {
-    $str = ($line -split '\|', 4)[2]
-    $cLines.Add("    [LA_S$strid] = `"$(Escape-CString $str)`",")
+    $parts = $line -split '\|', 4; $str = $parts[2]; $key = $parts[1]
+    $idName = if ($map.ContainsKey("S|$key")) { $map["S|$key"] } else { "LA_S$strid" }
+    $eSid = if ($mapSid.ContainsKey("S|$key")) { $mapSid["S|$key"] } else { 0 }
+    $cLines.Add("    [$idName] = `"$(Escape-CString $str)`",  /* SID:$eSid */")
     $strid++
 }
 $fid = 0
 foreach ($line in $formatLines) {
-    $str = ($line -split '\|', 4)[2]
-    $cLines.Add("    [LA_F$fid] = `"$(Escape-CString $str)`",")
+    $parts = $line -split '\|', 4; $str = $parts[2]; $key = $parts[1]
+    $idName = if ($map.ContainsKey("F|$key")) { $map["F|$key"] } else { "LA_F$fid" }
+    $eSid = if ($mapSid.ContainsKey("F|$key")) { $mapSid["F|$key"] } else { 0 }
+    $cLines.Add("    [$idName] = `"$(Escape-CString $str)`",  /* SID:$eSid */")
     $fid++
 }
 
@@ -715,25 +812,71 @@ if ($ExportMode) {
 
 if ($ImportSuffix -ne "") {
     $importH = Join-Path $SourceDir "LANG.$ImportSuffix.h"
-    if (Test-Path $importH) {
+
+    # 仅在 reinit 时备份
+    if ((Test-Path $importH) -and $I18NReinit) {
         $bak = "$importH.bak"
-        Move-Item $importH $bak -Force
-        Write-Host "Backed up existing file: $bak"
+        Copy-Item $importH $bak -Force
+        Write-Host "Backed up existing file (reinit): $bak"
     }
+
+    # 解析旧 import 文件：建立 SID → 旧译文 映射
+    $oldImportMap = @{}   # SID → old_translation
+    if (Test-Path $importH) {
+        Get-Content $importH | ForEach-Object {
+            if ($_ -match '\[LA_[WSF]\d+\]\s*=\s*"((?:[^"\\]|\\.)*)",.*SID:(\d+)') {
+                $val = $Matches[1]; $s2 = [int]$Matches[2]
+                if ($s2 -gt 0 -and -not $oldImportMap.ContainsKey($s2)) { $oldImportMap[$s2] = $val }
+            }
+        }
+    }
+
     $iLines = [System.Collections.Generic.List[string]]::new()
-    $iLines.Add("/* Auto-generated language strings */")
+    $iLines.Add("/*")
+    $iLines.Add(" * Auto-generated language strings")
+    $iLines.Add(" */")
     $iLines.Add("")
     $iLines.Add("#include `".LANG.h`"")
     $iLines.Add("")
+    $iLines.Add("/* Embedded $ImportSuffix language table */")
     $iLines.Add("static const char* lang_${ImportSuffix}[LA_NUM] = {")
-    $wid = 0
-    foreach ($line in $wordLines)   { $iLines.Add("    [LA_W$wid] = `"$(Escape-CString (($line -split '\|',4)[2]))`","); $wid++ }
-    $strid = 0
-    foreach ($line in $stringLines) { $iLines.Add("    [LA_S$strid] = `"$(Escape-CString (($line -split '\|',4)[2]))`","); $strid++ }
-    $fid = 0
-    foreach ($line in $formatLines) { $iLines.Add("    [LA_F$fid] = `"$(Escape-CString (($line -split '\|',4)[2]))`","); $fid++ }
+
+    $newCount = 0; $updatedCount = 0
+
+    function Add-ImportEntry {
+        param([string]$Type, [string]$Key, [string]$Escaped)
+        $idName   = if ($map.ContainsKey("${Type}|${Key}"))    { $map["${Type}|${Key}"]    } else { "0" }
+        $eSid     = if ($mapSid.ContainsKey("${Type}|${Key}")) { $mapSid["${Type}|${Key}"] } else { 0 }
+        $oldTrans = if ($oldImportMap.ContainsKey($eSid))          { $oldImportMap[$eSid]          } else { $null }
+        $oldEn    = if ($oldSidMap.ContainsKey($eSid))             { $oldSidMap[$eSid]             } else { $null }
+        if ($null -eq $oldTrans) {
+            $iLines.Add("    [$idName] = `"$Escaped`",  /* SID:$eSid new */")
+            $script:newCount++
+        } elseif ($null -ne $oldEn -and $oldEn -ne $Escaped) {
+            $iLines.Add("    [$idName] = `"$oldTrans`",  /* [SID:$eSid] UPDATED new: `"$Escaped`" */")
+            $script:updatedCount++
+        } else {
+            $iLines.Add("    [$idName] = `"$oldTrans`",  /* SID:$eSid */")
+        }
+    }
+
+    foreach ($line in $wordLines)   {
+        $parts = $line -split '\|', 4
+        Add-ImportEntry -Type "W" -Key $parts[1] -Escaped (Escape-CString $parts[2])
+    }
+    foreach ($line in $stringLines) {
+        $parts = $line -split '\|', 4
+        Add-ImportEntry -Type "S" -Key $parts[1] -Escaped (Escape-CString $parts[2])
+    }
+    foreach ($line in $formatLines) {
+        $parts = $line -split '\|', 4
+        Add-ImportEntry -Type "F" -Key $parts[1] -Escaped (Escape-CString $parts[2])
+    }
+
     $iLines.Add("};")
     [System.IO.File]::WriteAllLines($importH, $iLines, [System.Text.UTF8Encoding]::new($false))
+    if ($newCount -gt 0)     { Write-Host "  NOTE: $newCount new string(s) added as English placeholders (marked /* new */)" }
+    if ($updatedCount -gt 0) { Write-Host "  NOTE: $updatedCount string(s) English changed — old translation kept, marked /* [SID:N] UPDATED new: ... */" }
 }
 
 # ============================================================================
@@ -761,12 +904,16 @@ Write-Host ""
 Write-Host "Updating source files..."
 
 # 正则替换 MatchEvaluator（PS 5.1+ 支持 ScriptBlock 作为 MatchEvaluator）
-$reW = [regex]'(LA_W\s*\(\s*"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)'
-$reS = [regex]'(LA_S\s*\(\s*"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)'
-$reF = [regex]'(LA_F\s*\(\s*"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)'
+# 可选消耗已有的数字第三参数（SID），避免重复追加
+$reW = [regex]'(LA_W\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
+$reS = [regex]'(LA_S\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
+$reF = [regex]'(LA_F\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
+# 多段字符串字面量（如 PRIu64 宏拼接）：强制 ID/SID 为 0, 0
+$reMultiSeg = [regex]'(LA_[WSF]\s*\(\s*(?:u8|[uLU])?"(?:[^"\\]|\\.)*"\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*"(?:[^"\\]|\\.)*"\s*)+,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
 
-# 闭包引用 $map（PowerShell 闭包通过 $using: 或直接捕获）
-$mapRef = $map
+# 闭包引用 $map 和 $mapSid
+$mapRef    = $map
+$mapSidRef = $mapSid
 
 Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
     Where-Object { $_.FullName -ne $OutputH -and $_.FullName -ne $OutputC } |
@@ -775,28 +922,34 @@ Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
         try {
             $content = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
 
+            # 先处理多段字符串字面量（如 PRIu64 宏拼接），将旧 ID/SID 清零
+            $content = $reMultiSeg.Replace($content, '${1}0, 0')
+
             $content = $reW.Replace($content, [System.Text.RegularExpressions.MatchEvaluator]{
                 param($m)
-                $prefix = $m.Groups[1].Value
-                $key    = $m.Groups[2].Value.Trim().ToLower()
-                $sid    = if ($mapRef.ContainsKey("W|$key")) { $mapRef["W|$key"] } else { "0" }
-                "$prefix$sid"
+                $prefix  = $m.Groups[1].Value
+                $key     = $m.Groups[2].Value.Trim().ToLower()
+                $idVal   = if ($mapRef.ContainsKey("W|$key"))    { $mapRef["W|$key"]    } else { "0" }
+                $sidVal  = if ($mapSidRef.ContainsKey("W|$key")) { $mapSidRef["W|$key"] } else { 0 }
+                "$prefix$idVal, $sidVal"
             })
 
             $content = $reS.Replace($content, [System.Text.RegularExpressions.MatchEvaluator]{
                 param($m)
-                $prefix = $m.Groups[1].Value
-                $key    = $m.Groups[2].Value.ToLower()
-                $sid    = if ($mapRef.ContainsKey("S|$key")) { $mapRef["S|$key"] } else { "0" }
-                "$prefix$sid"
+                $prefix  = $m.Groups[1].Value
+                $key     = $m.Groups[2].Value.ToLower()
+                $idVal   = if ($mapRef.ContainsKey("S|$key"))    { $mapRef["S|$key"]    } else { "0" }
+                $sidVal  = if ($mapSidRef.ContainsKey("S|$key")) { $mapSidRef["S|$key"] } else { 0 }
+                "$prefix$idVal, $sidVal"
             })
 
             $content = $reF.Replace($content, [System.Text.RegularExpressions.MatchEvaluator]{
                 param($m)
-                $prefix = $m.Groups[1].Value
-                $str    = $m.Groups[2].Value
-                $sid    = if ($mapRef.ContainsKey("F|$str")) { $mapRef["F|$str"] } else { "0" }
-                "$prefix$sid"
+                $prefix  = $m.Groups[1].Value
+                $str2    = $m.Groups[2].Value
+                $idVal   = if ($mapRef.ContainsKey("F|$str2"))    { $mapRef["F|$str2"]    } else { "0" }
+                $sidVal  = if ($mapSidRef.ContainsKey("F|$str2")) { $mapSidRef["F|$str2"] } else { 0 }
+                "$prefix$idVal, $sidVal"
             })
 
             [System.IO.File]::WriteAllText($file, $content, [System.Text.UTF8Encoding]::new($false))
@@ -809,6 +962,18 @@ Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
 Write-Host ""
 Write-Host "Done! Source files updated with correct LA_W/F/Sxxx IDs"
 Write-Host "Next: Rebuild with updated LANG.c"
+
+# 保存 SID_NEXT 到 .i18n 文件（始终写入）
+# reinit 时不做 max 提升；正常模式下推至已提取的最大 SID+1 防止冲突
+if (-not $I18NReinit -and $maxSid -ge $SidNext) {
+    $SidNext = $maxSid + 1
+}
+[System.IO.File]::WriteAllText($I18NFile, "SID_NEXT=$SidNext`n", [System.Text.UTF8Encoding]::new($false))
+if ($SidNext -gt $SidNextStart) {
+    Write-Host "Updated $I18NFile`: SID_NEXT=$SidNext (allocated $($SidNext - $SidNextStart) new IDs)"
+} else {
+    Write-Host "Updated $I18NFile`: SID_NEXT=$SidNext (no new IDs allocated)"
+}
 
 # 清理临时文件
 Remove-Item $TempMarkerH -ErrorAction SilentlyContinue

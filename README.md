@@ -30,9 +30,15 @@
 #include <i18n.h>
 // or: #include "LANG.h"   (after running i18n.sh once)
 
+printf(LA_S("Connection established", LA_S0));
+printf(LA_F("[%s] error %d\n", LA_F1), peer, code);
+printf(LA_W("CONNECTED", LA_W2));
+```
+
+首次运行时可使用占位符 `0`，提取工具会自动回写正确的 ID 和 SID：
+
+```c
 printf(LA_S("Connection established", 0));
-printf(LA_F("[%s] error %d\n", 0), peer, code);
-printf(LA_W("CONNECTED", 0));
 ```
 
 未定义 `I18N_ENABLED` 时，`LA_W` / `LA_S` / `LA_F` 在编译期直接展开为字面量——零开销，零链接依赖。
@@ -47,8 +53,9 @@ i18n\i18n.bat p2p_server       # Windows
 生成：
 
 - `p2p_server/.LANG.h` — 所有字符串 ID 的枚举（`LA_W0`、`LA_S3`、`LA_F12` …）
-- `p2p_server/.LANG.c` — 英文字符串表 `lang_en[]`
-- 将源码中所有 `LA_*(str, 0)` 回写为 `LA_*(str, LA_Wn)`
+- `p2p_server/.LANG.c` — 英文字符串表 `lang_en[]`，每条带 `/* SID:N */` 注释
+- `p2p_server/.i18n` — SID 计数器状态文件（`SID_NEXT=N`），用于跨版本稳定追踪
+- 将源码中所有 `LA_*(str, 旧ID)` 回写为 `LA_*(str, LA_Xn, SID)`
 
 ### 3. 在构建中开启 i18n
 
@@ -71,10 +78,13 @@ lang_load_fp(fopen("lang.zh", "r"));       // optionally load a translation
 
 | 宏 | 用途 | 示例 |
 |---|---|---|
-| `LA_W(str, id)` | 单词 / 短标记 | `LA_W("CONNECTED", LA_W2)` |
-| `LA_S(str, id)` | 完整句子 | `LA_S("Server started", LA_S0)` |
-| `LA_F(fmt, id)` | printf 格式字符串 | `LA_F("Port %d open\n", LA_F1)` |
+| `LA_W(str, id, sid)` | 单词 / 短标记 | `LA_W("CONNECTED", LA_W2, 3)` |
+| `LA_S(str, id, sid)` | 完整句子 | `LA_S("Server started", LA_S0, 17)` |
+| `LA_F(fmt, id, ...)` | printf 格式字符串 | `LA_F("Port %d open\n", LA_F1, 33)` |
 | `LA_ID(id, ...)` | 直接按 ID 查找（无字面量） | `LA_ID(LA_W2)` |
+
+- **第 2 参数**（`LA_Xn`）：数组下标，由工具自动回写，开启 `I18N_ENABLED` 后类型检查自动居中
+- **第 3 参数 SID**：字符串唯一序列号，纯数字常量，`LA_W/LA_S` 的 `...` 参数吸收并导致编译器完全忽略；不影响运行效率
 
 未定义 `I18N_ENABLED` 时，`LA_W/S/F` 直接返回字面量——生成的二进制与从未使用 i18n 的代码完全一致。
 
@@ -87,7 +97,7 @@ lang_load_fp(fopen("lang.zh", "r"));       // optionally load a translation
 
 选项：
   --export          同时输出 lang.en（翻译模板）
-  --import SUFFIX   从已翻译的 lang.SUFFIX 生成 lang.SUFFIX.h
+  --import SUFFIX   生成/更新 LANG.SUFFIX.h（保留已有译文，标记新增与变更条目）
   --debug           将所有中间临时文件保存到 ./i18n/debug/ 以供排查
 ```
 
@@ -102,13 +112,30 @@ lang_load_fp(fopen("lang.zh", "r"));       // optionally load a translation
 cp p2p_server/lang.en p2p_server/lang.zh
 $EDITOR p2p_server/lang.zh
 
-# 3. 导入 — 生成包含 lang_zh[] 表的 lang.zh.h
+# 3. 导入 — 生成包含 lang_zh[] 表的 LANG.zh.h
 ./i18n/i18n.sh p2p_server --import zh
-# -> p2p_server/lang.zh.h
+# -> p2p_server/LANG.zh.h
 
 # 4. 运行时激活
 lang_load_fp(fopen("lang.zh", "r"));
 // 或：lang_load(lang_zh, LA_NUM);   （静态嵌入二进制）
+```
+
+#### --import 三种情况
+
+每次运行 `--import` 时，工具通过 SID 比对旧译文，自动处理三种情形：
+
+| 情形 | 生成注释 | 含义 |
+|---|---|---|
+| 当前版本首次出现的字符串 | `/* SID:N new */` | 以英文原文作占位，等待翻译 |
+| 英文内容较上次发生变化 | `/* [SID:N] UPDATED new: "新英文" */` | 旧译文被保留，需人工核对以更新译文 |
+| 英文内容未变 | `/* SID:N */` | 直接沿用已有译文 |
+
+每次运行时若有新增或变更条目，工具会打印提示：
+
+```
+  NOTE: 3 new string(s) added as English placeholders (marked /* new */)
+  NOTE: 1 string(s) English changed — old translation kept, marked /* [SID:N] UPDATED new: ... */
 ```
 
 ---
@@ -161,7 +188,40 @@ enum {
 extern const char* lang_en[LA_NUM];
 ```
 
-### `lang.en`（翻译模板）
+### `.LANG.c`（含 SID 注释）
+
+```c
+const char* lang_en[LA_NUM] = {
+    [LA_W0] = "disabled",       /* SID:1 */
+    [LA_W1] = "enabled",        /* SID:2 */
+    [LA_S0] = "Server started", /* SID:17 */
+    [LA_F0] = "Port %d\n",      /* SID:33 */
+};
+```
+
+SID（Serial ID）是每个字符串条目的唯一持久编号，写在注释中供工具读取，不影响 C 编译器。
+
+### `.i18n`（SID 状态文件）
+
+```
+SID_NEXT=44
+```
+
+每次运行后自动更新，记录下一个可用 SID。各源码子目录独立计数，删除该文件将触发全量重新初始化（所有条目 SID 从 1 重新分配）。
+
+### `LANG.zh.h`（--import 生成）
+
+```c
+static const char* lang_zh[LA_NUM] = {
+    [LA_W0] = "已禁用",          /* SID:1 */
+    [LA_W1] = "已启用",          /* SID:2 */
+    [LA_S0] = "服务器已启动",    /* SID:17 */
+    [LA_S1] = "Server error",   /* SID:18 new */
+    [LA_F0] = "端口 %d\n",      /* [SID:33] UPDATED new: "Port %d open\n" */
+};
+```
+
+### `lang.en`（--export 翻译模板）
 
 ```
 # Language Table (one string per line)
@@ -203,6 +263,7 @@ Port %d\n
 - **运行时零扫描** — 运行时仅做数组下标查找，启动时无任何字符串解析开销
 - **格式符安全** — 翻译版格式字符串在加载时与英文模板逐一校验，类型不匹配直接拒绝
 - **确定性 ID** — 以 `LC_ALL=C` 排序，保证 macOS 与 Linux 生成相同的 ID 编号
+- **稳定 SID** — 每个字符串持有唯一序列号，跨版本追踪英文内容变更，译文带 UPDATED 标柨提醒人工核对
 - **最小工具链** — 提取仅依赖 `cc -E`、`awk`、`sort`，均为标准 POSIX 工具
 
 ---

@@ -106,15 +106,33 @@
 # 注意：ID 编号由排序决定，添加/删除字符串可能导致 ID 重新分配
 #
 # ============================================================================
+# NDEBUG 双模式（i18n.sh 命令行选项 --ndebug）
+# ============================================================================
+#
+# 默认 (Debug):
+#   - 枚举 ID 名称基于 SID（稳定自增编号），如 LA_W5, LA_S26, LA_F96
+#   - 枚举按 SID 顺序排列，空洞用占位符 _LA_N 填充，LA_NUM 覆盖全部 SID
+#   - 数组可能有空洞（以空间换稳定性：lang_str() 对 NULL 返回 ""）
+#   - 增删条目不影响已有项的 ID，避免源文件大面积 diff 污染
+#
+# --ndebug (Release):
+#   - 枚举按类型分组连续编号，如 LA_W0~Wn, LA_S0~Sn, LA_F0~Fn
+#   - 数组紧凑无空洞，最小化内存占用
+#   - 增删条目会导致现有 ID 值重新分配
+#
+# 两种模式共用相同的 SID 追踪系统（.i18n 文件），切换无需重新初始化
+#
+# ============================================================================
 
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <source_dir> [--export] [--import SUFFIX]"
+    echo "Usage: $0 <source_dir> [--ndebug] [--export] [--import SUFFIX]"
     echo "Example: $0 p2p_ping"
     echo "Options:"
     echo "  --export          Export lang.en template file for translations"
     echo "  --import SUFFIX   Generate LANG.SUFFIX.h with embedded language table from lang.SUFFIX"
+    echo "  --ndebug          Generate compact sequential IDs (release mode)"
     echo "  --debug           Keep temp files in ./i18n/debug/ for inspection"
     exit 1
 fi
@@ -122,6 +140,7 @@ fi
 SOURCE_DIR="$1"
 EXPORT_LANG_EN=0
 IMPORT_SUFFIX=""
+NDEBUG_MODE=0
 DEBUG_MODE=0
 
 # 解析选项
@@ -139,6 +158,9 @@ while [ $# -gt 0 ]; do
             fi
             IMPORT_SUFFIX="$1"
             ;;
+        --ndebug)
+            NDEBUG_MODE=1
+            ;;
         --debug)
             DEBUG_MODE=1
             ;;
@@ -153,6 +175,21 @@ done
 OUTPUT_H="$SOURCE_DIR/.LANG.h"
 OUTPUT_C="$SOURCE_DIR/.LANG.c"
 USER_LANG_H="$SOURCE_DIR/LANG.h"
+
+# 加载/初始化持久化 SID 计数器（与 .LANG.c 同目录的 .i18n 文件）
+# SID 是字符串条目的唯一序列号，跨版本稳定追踪；各子目录独立计数，互不干扰
+# 若 .i18n 不存在则全量重新初始化（所有条目重新从 1 分配 SID）
+I18N_FILE="$SOURCE_DIR/.i18n"
+SID_NEXT=""
+I18N_REINIT=0
+if [ -f "$I18N_FILE" ]; then
+    SID_NEXT=$(awk -F= '/^SID_NEXT=/{print $2}' "$I18N_FILE" | tr -d '[:space:]')
+else
+    I18N_REINIT=1
+    echo "Note: $I18N_FILE not found — reinitializing all SIDs from 1"
+fi
+[ -z "${SID_NEXT:-}" ] && SID_NEXT=1
+SID_NEXT_START=$SID_NEXT
 
 if [ ! -d "$SOURCE_DIR" ]; then
     echo "Error: Directory not found: $SOURCE_DIR"
@@ -213,6 +250,9 @@ if [ "$DEBUG_MODE" -eq 1 ]; then
     TEMP_FORMATS="$_debug_dir/formats.txt"
     TEMP_STRINGS="$_debug_dir/strings.txt"
     TEMP_MAP="$_debug_dir/map.txt"
+    TEMP_OLD_SID_MAP="$_debug_dir/old_sid_map.txt"
+    TEMP_OLD_IMPORT_MAP="$_debug_dir/old_import_map.txt"
+    TEMP_ENUM_DATA="$_debug_dir/enum_data.txt"
     echo "Debug mode: temp files saved to $_debug_dir/"
 else
     TEMP_ALL=$(mktemp)
@@ -220,11 +260,15 @@ else
     TEMP_FORMATS=$(mktemp)
     TEMP_STRINGS=$(mktemp)
     TEMP_MAP=$(mktemp)
+    TEMP_OLD_SID_MAP=$(mktemp)
+    TEMP_OLD_IMPORT_MAP=$(mktemp)
+    TEMP_ENUM_DATA=$(mktemp)
 fi
 
 cleanup() {
     if [ "$DEBUG_MODE" -eq 0 ]; then
-        rm -f "$TEMP_ALL" "$TEMP_WORDS" "$TEMP_FORMATS" "$TEMP_STRINGS" "$TEMP_MAP"
+        rm -f "$TEMP_ALL" "$TEMP_WORDS" "$TEMP_FORMATS" "$TEMP_STRINGS" "$TEMP_MAP" \
+              "$TEMP_OLD_SID_MAP" "$TEMP_OLD_IMPORT_MAP" "$TEMP_ENUM_DATA"
     fi
 }
 trap cleanup EXIT
@@ -372,13 +416,13 @@ _cc_and_flags_for_file() {
 _marker_h=$(mktemp /tmp/i18n_markers_XXXXXX)  # BSD mktemp 要求 X 在末尾，不带后缀
 cat > "$_marker_h" <<'MARKER_EOF'
 #ifndef LA_W
-#define LA_W(WD, ID) _I18NW_ WD _I18NW_END_
+#define LA_W(WD, ID, SID) _I18NW_ WD _I18NSID_ SID _I18NW_END_
 #endif
 #ifndef LA_S
-#define LA_S(STR, ID) _I18NS_ STR _I18NS_END_
+#define LA_S(STR, ID, SID) _I18NS_ STR _I18NSID_ SID _I18NS_END_
 #endif
 #ifndef LA_F
-#define LA_F(FMT, ...) _I18NF_ FMT _I18NF_END_
+#define LA_F(FMT, ID, SID, ...) _I18NF_ FMT _I18NSID_ SID _I18NF_END_
 #endif
 MARKER_EOF
 
@@ -418,26 +462,39 @@ find "$SOURCE_DIR" \( -name "*.c" -o -name "*.h" \) \
             fragment = substr(rest2, 1, RSTART - 1)
             pos = pos + RSTART + RLENGTH - 1
 
-            # 从 fragment 中提取并拼接所有字符串字面量（含宽字符串 L"..."）
+            # 在 fragment 中分离字符串部分和 SID 部分
+            # 格式: <strings> _I18NSID_ <sid> （SID 由 marker 宏从源码透传）
+            esid = 0
+            str_frag = fragment
+            if (match(fragment, /_I18NSID_/)) {
+                str_frag = substr(fragment, 1, RSTART - 1)
+                _sf = substr(fragment, RSTART + RLENGTH)
+                gsub(/[ \t\n]/, "", _sf)
+                esid = _sf + 0
+            }
+
+            # 从 str_frag 中提取并拼接所有字符串字面量（含宽字符串 L"..."）
             result = ""
-            fpos = 1; flen = length(fragment)
+            nlit = 0   # 统计字符串字面量个数（>1 = 宏拼接，如 PRIu64）
+            fpos = 1; flen = length(str_frag)
             while (fpos <= flen) {
-                c1 = substr(fragment, fpos, 1)
+                c1 = substr(str_frag, fpos, 1)
                 # 跳过 C 字符串前缀：L"..." / u"..." / U"..." / u8"..."
                 if (c1 ~ /[LuU]/ && fpos+1 <= flen) {
-                    nxt = substr(fragment, fpos+1, 1)
+                    nxt = substr(str_frag, fpos+1, 1)
                     if (nxt == "\"") {
                         fpos++; c1 = "\""
-                    } else if (c1 == "u" && nxt == "8" && fpos+2 <= flen && substr(fragment, fpos+2, 1) == "\"") {
+                    } else if (c1 == "u" && nxt == "8" && fpos+2 <= flen && substr(str_frag, fpos+2, 1) == "\"") {
                         fpos += 2; c1 = "\""
                     }
                 }
                 if (c1 == "\"") {
+                    nlit++
                     fpos++
                     while (fpos <= flen) {
-                        c2 = substr(fragment, fpos, 1)
+                        c2 = substr(str_frag, fpos, 1)
                         if (c2 == "\\") {
-                            result = result substr(fragment, fpos, 2)
+                            result = result substr(str_frag, fpos, 2)
                             fpos += 2
                         } else if (c2 == "\"") {
                             fpos++; break
@@ -450,14 +507,17 @@ find "$SOURCE_DIR" \( -name "*.c" -o -name "*.h" \) \
                 }
             }
 
+            # 多段字符串字面量 = 含宏拼接（如 PRIu64），无法通过原始源码追踪 SID，跳过
+            if (nlit > 1) { result = "" }
+
             if (result != "") {
                 if (tp == "W") {
                     key = result; gsub(/^[ \t]+|[ \t]+$/, "", key)
-                    print "W|" tolower(key) "|" key "|" base
+                    print "W|" tolower(key) "|" key "|" base "|" esid
                 } else if (tp == "S") {
-                    print "S|" tolower(result) "|" result "|" base
+                    print "S|" tolower(result) "|" result "|" base "|" esid
                 } else {
-                    print "F|" result "|" result "|" base
+                    print "F|" result "|" result "|" base "|" esid
                 }
             }
         }
@@ -470,43 +530,46 @@ find "$SOURCE_DIR" \( -name "*.c" -o -name "*.h" \) \
 done > "$TEMP_ALL"
 rm -f "$_marker_h"
 
-# 分类并聚合文件名（去重 key，合并文件列表）
+# 分类并聚合文件名（去重 key，合并文件列表，保留首个非零 SID）
 grep "^W|" "$TEMP_ALL" | awk -F'|' '{
-    key=$2; str=$3; file=$4;
+    key=$2; str=$3; file=$4; sid=$5+0;
     if (seen[key]) {
         if (index(files[key], file) == 0) files[key] = files[key] "," file;
+        if (sids[key]+0 == 0 && sid > 0) sids[key] = sid;
     } else {
-        seen[key]=1; strs[key]=str; files[key]=file; order[++n]=key;
+        seen[key]=1; strs[key]=str; files[key]=file; sids[key]=sid; order[++n]=key;
     }
 } END {
     for (i=1; i<=n; i++) {
-        k=order[i]; print "W|" k "|" strs[k] "|" files[k];
+        k=order[i]; print "W|" k "|" strs[k] "|" files[k] "|" sids[k]+0;
     }
 }' | LC_ALL=C sort -t'|' -k2,2 > "$TEMP_WORDS" || true
 
 grep "^F|" "$TEMP_ALL" | awk -F'|' '{
-    key=$2; str=$3; file=$4;
+    key=$2; str=$3; file=$4; sid=$5+0;
     if (seen[key]) {
         if (index(files[key], file) == 0) files[key] = files[key] "," file;
+        if (sids[key]+0 == 0 && sid > 0) sids[key] = sid;
     } else {
-        seen[key]=1; strs[key]=str; files[key]=file; order[++n]=key;
+        seen[key]=1; strs[key]=str; files[key]=file; sids[key]=sid; order[++n]=key;
     }
 } END {
     for (i=1; i<=n; i++) {
-        k=order[i]; print "F|" k "|" strs[k] "|" files[k];
+        k=order[i]; print "F|" k "|" strs[k] "|" files[k] "|" sids[k]+0;
     }
 }' | LC_ALL=C sort -t'|' -k2,2 > "$TEMP_FORMATS" || true
 
 grep "^S|" "$TEMP_ALL" | awk -F'|' '{
-    key=$2; str=$3; file=$4;
+    key=$2; str=$3; file=$4; sid=$5+0;
     if (seen[key]) {
         if (index(files[key], file) == 0) files[key] = files[key] "," file;
+        if (sids[key]+0 == 0 && sid > 0) sids[key] = sid;
     } else {
-        seen[key]=1; strs[key]=str; files[key]=file; order[++n]=key;
+        seen[key]=1; strs[key]=str; files[key]=file; sids[key]=sid; order[++n]=key;
     }
 } END {
     for (i=1; i<=n; i++) {
-        k=order[i]; print "S|" k "|" strs[k] "|" files[k];
+        k=order[i]; print "S|" k "|" strs[k] "|" files[k] "|" sids[k]+0;
     }
 }' | LC_ALL=C sort -t'|' -k2,2 > "$TEMP_STRINGS" || true
 
@@ -527,11 +590,121 @@ if [ "$total" -eq 0 ]; then
     exit 0
 fi
 
-# 生成 .h 文件
-cat > "$OUTPUT_H" <<EOF
+# 从当前（旧）.LANG.c 中提取 SID→字符串 映射（变更检测用，必须在覆写 .c 前完成）
+if [ -f "$OUTPUT_C" ]; then
+    awk '
+    /SID:[0-9]/ {
+        line = $0
+        idx = index(line, "SID:")
+        if (idx == 0) next
+        rest = substr(line, idx + 4)
+        entry_sid = ""
+        for (ci = 1; ci <= length(rest); ci++) {
+            ch = substr(rest, ci, 1)
+            if (ch ~ /[0-9]/) entry_sid = entry_sid ch
+            else break
+        }
+        if (entry_sid == "" || entry_sid+0 == 0) next
+        s = line; sub(/.*= "/, "", s)
+        val = ""
+        for (ci = 1; ci <= length(s); ci++) {
+            ch = substr(s, ci, 1)
+            if (ch == "\\") { val = val ch substr(s,ci+1,1); ci++ }
+            else if (ch == "\"") break
+            else val = val ch
+        }
+        if (entry_sid != "" && val != "") print entry_sid "|" val
+    }
+    ' "$OUTPUT_C" > "$TEMP_OLD_SID_MAP" 2>/dev/null || true
+else
+    : > "$TEMP_OLD_SID_MAP"
+fi
+
+# ======================================================================
+# Phase 1: 收集所有条目（SID 分配 + TEMP_MAP / TEMP_ENUM_DATA）
+# ======================================================================
+# TEMP_MAP 格式:       TYPE|key|id_name|sid   （源文件回写用）
+# TEMP_ENUM_DATA 格式: TYPE|id_name|sid|str|files_formatted[|params]
+#
+# NDEBUG 模式: id_name = LA_{T}{seq}（紧凑连续）
+# Debug 模式:  id_name = LA_{T}{sid}（SID 稳定映射）
+
+sid=0
+max_sid=0
+first_fmt_id=""
+w_seq=0; s_seq=0; f_seq=0
+
+# 词
+if [ "$word_count" -gt 0 ]; then
+    while IFS='|' read -r type key str files entry_sid; do
+        files_formatted=$(echo "$files" | sed 's/,/, /g')
+        if [ "$I18N_REINIT" -ne 0 ] || [ -z "${entry_sid:-}" ] || ! [ "$entry_sid" -gt 0 ] 2>/dev/null; then
+            entry_sid=$SID_NEXT; SID_NEXT=$((SID_NEXT + 1))
+        fi
+        if [ "$NDEBUG_MODE" -eq 1 ]; then
+            id_name="LA_W${w_seq}"; w_seq=$((w_seq + 1))
+        else
+            id_name="LA_W${entry_sid}"
+        fi
+        printf 'W|%s|%s|%s\n' "$key" "$id_name" "$entry_sid" >> "$TEMP_MAP"
+        printf 'W|%s|%s|%s|%s\n' "$id_name" "$entry_sid" "$str" "$files_formatted" >> "$TEMP_ENUM_DATA"
+        [ "$entry_sid" -gt "$max_sid" ] && max_sid=$entry_sid
+        sid=$((sid + 1))
+    done < "$TEMP_WORDS"
+fi
+
+# 字符串
+if [ "$string_count" -gt 0 ]; then
+    while IFS='|' read -r type key str files entry_sid; do
+        files_formatted=$(echo "$files" | sed 's/,/, /g')
+        if [ "$I18N_REINIT" -ne 0 ] || [ -z "${entry_sid:-}" ] || ! [ "$entry_sid" -gt 0 ] 2>/dev/null; then
+            entry_sid=$SID_NEXT; SID_NEXT=$((SID_NEXT + 1))
+        fi
+        if [ "$NDEBUG_MODE" -eq 1 ]; then
+            id_name="LA_S${s_seq}"; s_seq=$((s_seq + 1))
+        else
+            id_name="LA_S${entry_sid}"
+        fi
+        printf 'S|%s|%s|%s\n' "$key" "$id_name" "$entry_sid" >> "$TEMP_MAP"
+        printf 'S|%s|%s|%s|%s\n' "$id_name" "$entry_sid" "$str" "$files_formatted" >> "$TEMP_ENUM_DATA"
+        [ "$entry_sid" -gt "$max_sid" ] && max_sid=$entry_sid
+        sid=$((sid + 1))
+    done < "$TEMP_STRINGS"
+fi
+
+# 格式化（放在最后，方便校验）
+if [ "$format_count" -gt 0 ]; then
+    while IFS='|' read -r type key str files entry_sid; do
+        files_formatted=$(echo "$files" | sed 's/,/, /g')
+        if [ "$I18N_REINIT" -ne 0 ] || [ -z "${entry_sid:-}" ] || ! [ "$entry_sid" -gt 0 ] 2>/dev/null; then
+            entry_sid=$SID_NEXT; SID_NEXT=$((SID_NEXT + 1))
+        fi
+        if [ "$NDEBUG_MODE" -eq 1 ]; then
+            id_name="LA_F${f_seq}"; f_seq=$((f_seq + 1))
+        else
+            id_name="LA_F${entry_sid}"
+        fi
+        [ -z "$first_fmt_id" ] && first_fmt_id="$id_name"
+        params=$(printf '%s' "$str" | grep -o '%[sdifuxXclu]' 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)
+        printf 'F|%s|%s|%s\n' "$key" "$id_name" "$entry_sid" >> "$TEMP_MAP"
+        printf 'F|%s|%s|%s|%s|%s\n' "$id_name" "$entry_sid" "$str" "$files_formatted" "$params" >> "$TEMP_ENUM_DATA"
+        [ "$entry_sid" -gt "$max_sid" ] && max_sid=$entry_sid
+        sid=$((sid + 1))
+    done < "$TEMP_FORMATS"
+fi
+
+# ======================================================================
+# Phase 2: 生成 .LANG.h
+# ======================================================================
+#
+# --ndebug (Release): 枚举按类型分组连续编号，数组紧凑无空洞
+# 默认 (Debug):       枚举按 SID 顺序排列，空洞用占位符填充
+#                     增删条目不改变已有项的 ID，避免源文件大面积 diff 污染
+
+cat > "$OUTPUT_H" <<'EOF'
 /*
  * Auto-generated language IDs
- * 
+ *
  * DO NOT EDIT - Regenerate with: ./i18n/i18n.sh
  */
 
@@ -542,77 +715,79 @@ cat > "$OUTPUT_H" <<EOF
 #   define LA_PREDEFINED -1
 #endif
 
-enum {
-    LA_PRED = LA_PREDEFINED,  /* 基础 ID，后续 ID 从此开始递增 */
-    
 EOF
 
-sid=0
-
-# 词
-if [ "$word_count" -gt 0 ]; then
-    echo "    /* Words (LA_W) */" >> "$OUTPUT_H"
-    wid=0
-    while IFS='|' read -r type key str files; do
-        id_name="LA_W${wid}"
-        # 将逗号分隔的文件改为逗号+空格分隔
-        files_formatted=$(echo "$files" | sed 's/,/, /g')
-        printf '    %s,  /* "%s"  [%s] */\n' "$id_name" "$str" "$files_formatted" >> "$OUTPUT_H"
-        echo "W|$key|$id_name" >> "$TEMP_MAP"
-        wid=$((wid + 1))
-        sid=$((sid + 1))
-    done < "$TEMP_WORDS"
-    echo "" >> "$OUTPUT_H"
+if [ "$NDEBUG_MODE" -eq 1 ]; then
+    # --ndebug: 按类型分组，连续编号（紧凑模式）
+    _emit_enum_grouped() {
+        local _cur_type=""
+        while IFS='|' read -r etype eid esid estr efiles eparams; do
+            if [ "$etype" != "$_cur_type" ]; then
+                [ -n "$_cur_type" ] && echo ""
+                _cur_type="$etype"
+                case "$etype" in
+                    W) echo "    /* Words (LA_W) */" ;;
+                    S) echo "    /* Strings (LA_S) */" ;;
+                    F) echo "    /* Formats (LA_F) */" ;;
+                esac
+            fi
+            local _cmt
+            if [ "$etype" = "F" ] && [ -n "$eparams" ]; then
+                _cmt="/* \"$estr\" ($eparams)  [$efiles] */"
+            else
+                _cmt="/* \"$estr\"  [$efiles] */"
+            fi
+            printf '    %s,  %s\n' "$eid" "$_cmt"
+        done < "$TEMP_ENUM_DATA"
+    }
+    {
+    echo "enum {"
+    echo "    LA_PRED = LA_PREDEFINED,  /* 基础 ID，后续 ID 从此开始递增 */"
+    echo ""
+    _emit_enum_grouped
+    echo ""
+    echo "    LA_NUM"
+    echo "};"
+    } >> "$OUTPUT_H"
+else
+    # Debug: 按 SID 顺序排列，空洞用占位符填充
+    awk -F'|' -v max_sid="$max_sid" '
+    {
+        sid = $3 + 0
+        type[sid] = $1; eid[sid] = $2; estr[sid] = $4
+        efiles[sid] = $5; eparams[sid] = $6
+    }
+    END {
+        for (s = 1; s <= max_sid; s++) {
+            if (s in type) {
+                if (type[s] == "F" && eparams[s] != "")
+                    cmt = "/* \"" estr[s] "\" (" eparams[s] ")  [" efiles[s] "] */"
+                else
+                    cmt = "/* \"" estr[s] "\"  [" efiles[s] "] */"
+                printf "    %s,  %s\n", eid[s], cmt
+            } else {
+                printf "    _LA_%d,\n", s
+            }
+        }
+    }
+    ' "$TEMP_ENUM_DATA" > "${TEMP_ALL}.enum_body"
+    {
+    echo "enum {"
+    echo "    LA_PRED = LA_PREDEFINED,  /* 基础 ID，后续 ID 从此开始递增 */"
+    echo ""
+    cat "${TEMP_ALL}.enum_body"
+    echo ""
+    echo "    LA_NUM"
+    echo "};"
+    } >> "$OUTPUT_H"
+    rm -f "${TEMP_ALL}.enum_body"
 fi
 
-# 字符串
-if [ "$string_count" -gt 0 ]; then
-    echo "    /* Strings (LA_S) */" >> "$OUTPUT_H"
-    strid=0
-    while IFS='|' read -r type key str files; do
-        id_name="LA_S${strid}"
-        files_formatted=$(echo "$files" | sed 's/,/, /g')
-        printf '    %s,  /* "%s"  [%s] */\n' "$id_name" "$str" "$files_formatted" >> "$OUTPUT_H"
-        echo "S|$key|$id_name" >> "$TEMP_MAP"
-        strid=$((strid + 1))
-        sid=$((sid + 1))
-    done < "$TEMP_STRINGS"
-    echo "" >> "$OUTPUT_H"
-fi
+echo "" >> "$OUTPUT_H"
 
-# 格式化（放在最后，方便校验）
+# 添加 LA_FMT_START（格式字符串起始位置标记）
 if [ "$format_count" -gt 0 ]; then
-    echo "    /* Formats (LA_F) - Format strings for validation */" >> "$OUTPUT_H"
-    fid=0
-    while IFS='|' read -r type key str files; do
-        id_name="LA_F${fid}"
-        files_formatted=$(echo "$files" | sed 's/,/, /g')
-        params=$(printf '%s' "$str" | grep -o '%[sdifuxXclu]' 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)
-        if [ -n "$params" ]; then
-            printf '    %s,  /* "%s" (%s)  [%s] */\n' "$id_name" "$str" "$params" "$files_formatted" >> "$OUTPUT_H"
-        else
-            printf '    %s,  /* "%s"  [%s] */\n' "$id_name" "$str" "$files_formatted" >> "$OUTPUT_H"
-        fi
-        echo "F|$key|$id_name" >> "$TEMP_MAP"
-        fid=$((fid + 1))
-        sid=$((sid + 1))
-    done < "$TEMP_FORMATS"
-    echo "" >> "$OUTPUT_H"
-fi
-
-cat >> "$OUTPUT_H" <<EOF
-    LA_NUM = $sid
-};
-
-EOF
-
-# 添加 LA_F 定义（格式字符串起始位置标记）
-if [ "$format_count" -gt 0 ]; then
-    cat >> "$OUTPUT_H" <<'EOF'
-/* 格式字符串起始位置（用于验证） */
-#define LA_FMT_START LA_F0
-
-EOF
+    printf '/* 格式字符串起始位置（用于验证） */\n#define LA_FMT_START %s\n\n' "$first_fmt_id" >> "$OUTPUT_H"
 else
     cat >> "$OUTPUT_H" <<'EOF'
 /* 无格式字符串 */
@@ -673,32 +848,32 @@ fi
 
 # 词
 if [ "$word_count" -gt 0 ]; then
-    wid=0
     while IFS='|' read -r type key str files; do
-        # 转义字符串
-        escaped=$(printf '%s' "$str" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        printf '    [LA_W%s] = "%s",\n' "$wid" "$escaped" >> "$OUTPUT_C"
-        wid=$((wid + 1))
+        # 转义字符串（仅转义双引号；反斜杠序列如 \n 在提取时已保留为 C 原始形式，无需二次转义）
+        escaped=$(printf '%s' "$str" | sed 's/"/\\"/g')
+        id_name=$(_I18N_KEY="$key" awk -F'|' -v t="W" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $3; exit}' "$TEMP_MAP")
+        entry_sid=$(_I18N_KEY="$key" awk -F'|' -v t="W" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $4; exit}' "$TEMP_MAP")
+        printf '    [%s] = "%s",  /* SID:%s */\n' "${id_name:-LA_W0}" "$escaped" "${entry_sid:-0}" >> "$OUTPUT_C"
     done < "$TEMP_WORDS"
 fi
 
 # 字符串
 if [ "$string_count" -gt 0 ]; then
-    strid=0
     while IFS='|' read -r type key str files; do
-        escaped=$(printf '%s' "$str" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        printf '    [LA_S%s] = "%s",\n' "$strid" "$escaped" >> "$OUTPUT_C"
-        strid=$((strid + 1))
+        escaped=$(printf '%s' "$str" | sed 's/"/\\"/g')
+        id_name=$(_I18N_KEY="$key" awk -F'|' -v t="S" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $3; exit}' "$TEMP_MAP")
+        entry_sid=$(_I18N_KEY="$key" awk -F'|' -v t="S" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $4; exit}' "$TEMP_MAP")
+        printf '    [%s] = "%s",  /* SID:%s */\n' "${id_name:-LA_S0}" "$escaped" "${entry_sid:-0}" >> "$OUTPUT_C"
     done < "$TEMP_STRINGS"
 fi
 
 # 格式化
 if [ "$format_count" -gt 0 ]; then
-    fid=0
     while IFS='|' read -r type key str files; do
-        escaped=$(printf '%s' "$str" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        printf '    [LA_F%s] = "%s",\n' "$fid" "$escaped" >> "$OUTPUT_C"
-        fid=$((fid + 1))
+        escaped=$(printf '%s' "$str" | sed 's/"/\\"/g')
+        id_name=$(_I18N_KEY="$key" awk -F'|' -v t="F" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $3; exit}' "$TEMP_MAP")
+        entry_sid=$(_I18N_KEY="$key" awk -F'|' -v t="F" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $4; exit}' "$TEMP_MAP")
+        printf '    [%s] = "%s",  /* SID:%s */\n' "${id_name:-LA_F0}" "$escaped" "${entry_sid:-0}" >> "$OUTPUT_C"
     done < "$TEMP_FORMATS"
 fi
 
@@ -787,13 +962,46 @@ fi
 if [ -n "$IMPORT_SUFFIX" ]; then
     OUTPUT_IMPORT_H="$SOURCE_DIR/LANG.$IMPORT_SUFFIX.h"
     
-    # 备份已存在的文件
-    if [ -f "$OUTPUT_IMPORT_H" ]; then
+    # 仅在 reinit 时备份（SID 已稳定追踪变更，正常运行无需 .bak）
+    if [ -f "$OUTPUT_IMPORT_H" ] && [ "$I18N_REINIT" -eq 1 ]; then
         BACKUP_FILE="${OUTPUT_IMPORT_H}.bak"
-        mv "$OUTPUT_IMPORT_H" "$BACKUP_FILE"
-        echo "Backed up existing file: $BACKUP_FILE"
+        cp "$OUTPUT_IMPORT_H" "$BACKUP_FILE"
+        echo "Backed up existing file (reinit): $BACKUP_FILE"
     fi
-    
+
+    # 解析旧 import 文件：建立 SID → 旧译文 映射
+    # 格式：    [LA_Xx] = "译文",  /* SID:N */  或  /* UPDATED [SID:N] ... */
+    : > "$TEMP_OLD_IMPORT_MAP"
+    if [ -f "$OUTPUT_IMPORT_H" ]; then
+        awk '
+        /\[LA_[WSF][0-9]+\]/ {
+            line = $0
+            # 提取 SID
+            entry_sid = ""
+            idx = index(line, "SID:")
+            if (idx > 0) {
+                rest = substr(line, idx + 4)
+                for (ci = 1; ci <= length(rest); ci++) {
+                    ch = substr(rest, ci, 1)
+                    if (ch ~ /[0-9]/) entry_sid = entry_sid ch
+                    else break
+                }
+            }
+            if (entry_sid == "" || entry_sid + 0 == 0) next
+            # 提取译文内容（] = "…"）
+            val = line; sub(/.*\] = "/, "", val)
+            result = ""
+            for (ci = 1; ci <= length(val); ci++) {
+                ch = substr(val, ci, 1)
+                if (ch == "\\") { result = result ch substr(val, ci+1, 1); ci++ }
+                else if (ch == "\"") break
+                else result = result ch
+            }
+            print entry_sid "|" result
+        }
+        ' "$OUTPUT_IMPORT_H" > "$TEMP_OLD_IMPORT_MAP" 2>/dev/null || true
+    fi
+
     # 生成头文件头部
     cat > "$OUTPUT_IMPORT_H" <<EOF
 /*
@@ -805,42 +1013,67 @@ if [ -n "$IMPORT_SUFFIX" ]; then
 /* Embedded ${IMPORT_SUFFIX} language table */
 static const char* lang_${IMPORT_SUFFIX}[LA_NUM] = {
 EOF
-    
-    # 从 .LANG.c 读取已生成的字符串（作为翻译模板）
+
+    # 三种情况:
+    # 1. 新增条目（TEMP_OLD_IMPORT_MAP 中无此 SID）→ 写英文占位 + /* SID:N new */
+    # 2. 进入变更（英文内容变了）→ 保留旧译文 + /* UPDATED [SID:N] en: "new" */
+    # 3. 未变或无旧英文记录→ 保留旧译文 + /* SID:N */
+    _new_count=0; _updated_count=0
+
+    _import_loop() {
+        local _type="$1" _key="$2" _escaped="$3"
+        local _id_name _entry_sid _old_translation _old_english
+        _id_name=$(_I18N_KEY="$_key" awk -F'|' -v t="$_type" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $3; exit}' "$TEMP_MAP")
+        _entry_sid=$(_I18N_KEY="$_key" awk -F'|' -v t="$_type" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $4; exit}' "$TEMP_MAP")
+        _old_translation=$(awk -F'|' -v s="${_entry_sid:-0}" '$1==s {print $2; exit}' "$TEMP_OLD_IMPORT_MAP")
+        _old_english=$(awk -F'|' -v s="${_entry_sid:-0}" '$1==s {print $2; exit}' "$TEMP_OLD_SID_MAP")
+        if [ -z "${_old_translation:-}" ]; then
+            # 新增条目
+            printf '    [%s] = "%s",  /* SID:%s new */\n' \
+                "${_id_name}" "$_escaped" "${_entry_sid:-0}" >> "$OUTPUT_IMPORT_H"
+            _new_count=$((_new_count + 1))
+        elif [ -n "${_old_english:-}" ] && [ "$_old_english" != "$_escaped" ]; then
+            # 英文内容已变更，保留旧译文并标记 UPDATED
+            printf '    [%s] = "%s",  /* [SID:%s] UPDATED new: "%s" */\n' \
+                "${_id_name}" "$_old_translation" "${_entry_sid:-0}" "$_escaped" >> "$OUTPUT_IMPORT_H"
+            _updated_count=$((_updated_count + 1))
+        else
+            # 未变更
+            printf '    [%s] = "%s",  /* SID:%s */\n' \
+                "${_id_name}" "$_old_translation" "${_entry_sid:-0}" >> "$OUTPUT_IMPORT_H"
+        fi
+    }
+
     # 词
     if [ "$word_count" -gt 0 ]; then
-        wid=0
         while IFS='|' read -r type key str files; do
-            escaped=$(echo "$str" | sed 's/\\/\\\\/g; s/"/\\"/g')
-            echo "    [LA_W${wid}] = \"$escaped\"," >> "$OUTPUT_IMPORT_H"
-            wid=$((wid + 1))
+            escaped=$(printf '%s' "$str" | sed 's/"/\\"/g')
+            _import_loop "W" "$key" "$escaped"
         done < "$TEMP_WORDS"
     fi
-    
+
     # 字符串
     if [ "$string_count" -gt 0 ]; then
-        strid=0
         while IFS='|' read -r type key str files; do
-            escaped=$(echo "$str" | sed 's/\\/\\\\/g; s/"/\\"/g')
-            echo "    [LA_S${strid}] = \"$escaped\"," >> "$OUTPUT_IMPORT_H"
-            strid=$((strid + 1))
+            escaped=$(printf '%s' "$str" | sed 's/"/\\"/g')
+            _import_loop "S" "$key" "$escaped"
         done < "$TEMP_STRINGS"
     fi
-    
+
     # 格式化
     if [ "$format_count" -gt 0 ]; then
-        fid=0
         while IFS='|' read -r type key str files; do
-            escaped=$(echo "$str" | sed 's/\\/\\\\/g; s/"/\\"/g')
-            echo "    [LA_F${fid}] = \"$escaped\"," >> "$OUTPUT_IMPORT_H"
-            fid=$((fid + 1))
+            escaped=$(printf '%s' "$str" | sed 's/"/\\"/g')
+            _import_loop "F" "$key" "$escaped"
         done < "$TEMP_FORMATS"
     fi
-    
+
     # 生成尾部
     cat >> "$OUTPUT_IMPORT_H" <<EOF
 };
 EOF
+    [ "$_new_count" -gt 0 ]     && echo "  NOTE: $_new_count new string(s) added as English placeholders (marked /* new */)"
+    [ "$_updated_count" -gt 0 ] && echo "  NOTE: $_updated_count string(s) English changed — old translation kept, marked /* [SID:N] UPDATED new: ... */"
 fi
 
 echo "Generated:"
@@ -867,7 +1100,9 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
     awk -v mapfile="$TEMP_MAP" '
         BEGIN {
             while ((getline ln < mapfile) > 0) {
-                n = split(ln, a, "|"); if (n >= 3) mapn[a[1] SUBSEP a[2]] = a[3]
+                n = split(ln, a, "|");
+                if (n >= 3) mapn[a[1] SUBSEP a[2]] = a[3]
+                if (n >= 4) mapsid[a[1] SUBSEP a[2]] = a[4]
             }
             close(mapfile)
         }
@@ -882,6 +1117,12 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                         if (j <= L && substr(line,j,1) == "(") {
                             j++
                             while (j <= L && substr(line,j,1) ~ /[ \t]/) j++
+                            # Skip optional unicode string prefix: u" L" U" u8"
+                            ch = substr(line,j,1)
+                            if (ch == "u" || ch == "L" || ch == "U") {
+                                if (ch == "u" && substr(line,j+1,1) == "8" && substr(line,j+2,1) == "\"") j += 2
+                                else if (substr(line,j+1,1) == "\"") j += 1
+                            }
                             if (j <= L && substr(line,j,1) == "\"") {
                                 sv = ""; k = j+1
                                 while (k <= L) {
@@ -901,10 +1142,65 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                                         kv = sv
                                         if (t == "W") { gsub(/^[ \t]+|[ \t]+$/, "", kv); kv = tolower(kv) }
                                         else if (t == "S") kv = tolower(kv)
-                                        sid = mapn[t SUBSEP kv]
-                                        if (sid != "") {
-                                            result = result substr(line,i,eq-i+1) substr(line,eq+1,id0-eq-1) sid
+                                        new_id  = mapn[t SUBSEP kv]
+                                        new_sid = mapsid[t SUBSEP kv]
+                                        if (new_id != "") {
+                                            result = result substr(line,i,eq-i+1) substr(line,eq+1,id0-eq-1) new_id
+                                            if (new_sid != "") {
+                                                result = result ", " new_sid
+                                                # skip existing numeric 3rd arg if present
+                                                k2 = k
+                                                while (k2 <= L && substr(line,k2,1) ~ /[ \t]/) k2++
+                                                if (k2 <= L && substr(line,k2,1) == ",") {
+                                                    k3 = k2+1
+                                                    while (k3 <= L && substr(line,k3,1) ~ /[ \t]/) k3++
+                                                    if (k3 <= L && substr(line,k3,1) ~ /[0-9]/) {
+                                                        while (k3 <= L && substr(line,k3,1) ~ /[0-9]/) k3++
+                                                        k = k3
+                                                    }
+                                                }
+                                            }
                                             i = k; continue
+                                        }
+                                    }
+                                    # String literal concatenation (e.g. "..." PRIu64 "...")
+                                    # — cannot track SID through raw source; force-reset to 0, 0
+                                    else if (k <= L && substr(line,k,1) ~ /[A-Za-z_]/) {
+                                        _cdone = 0
+                                        _ck = k
+                                        while (!_cdone && _ck <= L) {
+                                            while (_ck <= L && substr(line,_ck,1) ~ /[A-Za-z0-9_]/) _ck++
+                                            while (_ck <= L && substr(line,_ck,1) ~ /[ \t]/) _ck++
+                                            if (_ck <= L && substr(line,_ck,1) == "\"") {
+                                                _ck++
+                                                while (_ck <= L) {
+                                                    _cc = substr(line,_ck,1)
+                                                    if (_cc == "\\") _ck += 2
+                                                    else if (_cc == "\"") { _ck++; break }
+                                                    else _ck++
+                                                }
+                                                while (_ck <= L && substr(line,_ck,1) ~ /[ \t]/) _ck++
+                                                if (_ck <= L && substr(line,_ck,1) == ",") _cdone = 1
+                                            } else break
+                                        }
+                                        if (_cdone) {
+                                            _ck++
+                                            while (_ck <= L && substr(line,_ck,1) ~ /[ \t]/) _ck++
+                                            _cid0 = _ck
+                                            while (_ck <= L && substr(line,_ck,1) ~ /[A-Za-z0-9_]/) _ck++
+                                            result = result substr(line, i, _cid0 - i) "0"
+                                            _ck2 = _ck
+                                            while (_ck2 <= L && substr(line,_ck2,1) ~ /[ \t]/) _ck2++
+                                            if (_ck2 <= L && substr(line,_ck2,1) == ",") {
+                                                _ck3 = _ck2 + 1
+                                                while (_ck3 <= L && substr(line,_ck3,1) ~ /[ \t]/) _ck3++
+                                                if (_ck3 <= L && substr(line,_ck3,1) ~ /[0-9]/) {
+                                                    while (_ck3 <= L && substr(line,_ck3,1) ~ /[0-9]/) _ck3++
+                                                    result = result ", 0"
+                                                    _ck = _ck3
+                                                }
+                                            }
+                                            i = _ck; continue
                                         }
                                     }
                                 }
@@ -923,3 +1219,15 @@ done
 echo
 echo "Done! Source files updated with correct LA_W/F/Sxxx IDs"
 echo "Next: Rebuild with updated LANG.c"
+
+# 保存 SID_NEXT 到 .i18n 文件（始终写入）
+# reinit 时不做 max 提升，正常模式下推至已提取的最大 SID+1 防止冲突
+if [ "$I18N_REINIT" -eq 0 ] && [ "$max_sid" -ge "$SID_NEXT" ] 2>/dev/null; then
+    SID_NEXT=$((max_sid + 1))
+fi
+printf 'SID_NEXT=%d\n' "$SID_NEXT" > "$I18N_FILE"
+if [ "$SID_NEXT" -gt "$SID_NEXT_START" ]; then
+    echo "Updated $I18N_FILE: SID_NEXT=$SID_NEXT (allocated $((SID_NEXT - SID_NEXT_START)) new IDs)"
+else
+    echo "Updated $I18N_FILE: SID_NEXT=$SID_NEXT (no new IDs allocated)"
+fi

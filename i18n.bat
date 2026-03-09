@@ -67,6 +67,6 @@ for %%B in (
 rem ---- 5. PowerShell fallback ------------------------------------------------
 echo [i18n] No bash environment found, using PowerShell implementation
 
-rem 将 --debug 等 bash 风格参数原样透传，i18n.ps1 内部用同名参数
+rem 将 --ndebug / --debug 等 bash 风格参数原样透传，i18n.ps1 内部用同名参数
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\i18n.ps1" %*
 exit /b %errorlevel%

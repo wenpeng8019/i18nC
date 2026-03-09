@@ -14,13 +14,13 @@
 #       define LA_ID(ID, ...) lang_str(ID)
 #   endif
 #   ifndef LA_W
-#       define LA_W(WD, ID) lang_str(ID)
+#       define LA_W(WD, ID, ...) lang_str(ID)
 #   endif
 #   ifndef LA_S
-#       define LA_S(STR, ID) lang_str(ID)
+#       define LA_S(STR, ID, ...) lang_str(ID)
 #   endif
 #   ifndef LA_F
-#       define LA_F(FMT, ID) lang_str(ID)
+#       define LA_F(FMT, ID, ...) lang_str(ID)
 #   endif
 #else
     /* 默认：使用英文字面量 */
@@ -28,13 +28,13 @@
 #       define LA_ID(ID, ...) lang_str(ID)
 #   endif
 #   ifndef LA_W
-#       define LA_W(WD, ID) WD
+#       define LA_W(WD, ID, ...) WD
 #   endif
 #   ifndef LA_S
-#       define LA_S(STR, ID) STR
+#       define LA_S(STR, ID, ...) STR
 #   endif
 #   ifndef LA_F
-#       define LA_F(FMT, ID) FMT
+#       define LA_F(FMT, ID, ...) FMT
 #   endif
 #endif
 

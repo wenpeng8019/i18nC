@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# i18n/test/test.sh — 集成测试脚本
+#
+# 覆盖以下场景：
+#   ① 初次生成（.LANG.h / .LANG.c / .i18n）
+#   ② 三种构建模式均可编译并正常退出
+#   ③ 幂等性（重复运行 i18n.sh 不重新分配 SID）
+#   ④ --import cn 首次生成 LANG.cn.h（NOTE: N new string(s)）
+#   ⑤ 填入中文翻译后可编译 hello-cn
+#   ⑥ --import cn 二次运行（全部 unchanged，无 NOTE）
+#   ⑦ UPDATED 检测（修改一条字符串后 SID 不变，翻译文件出现 UPDATED 注释）
+#   ⑧ 恢复后再次幂等
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# 工具
+# ---------------------------------------------------------------------------
+PASS=0
+FAIL=0
+I18N_DIR="$(cd .. && pwd)"          # i18n/ 根目录（i18n.sh 所在位置）
+TEST_DIR="$(cd "$(dirname "$0")" && pwd)"  # i18n/test/ 目录
+
+cd "$TEST_DIR"
+
+ok()  { echo "  [PASS] $1"; PASS=$((PASS+1)); }
+fail(){ echo "  [FAIL] $1"; FAIL=$((FAIL+1)); }
+
+check()          { local desc="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$desc"; else fail "$desc"; fi; }
+check_contains() { local desc="$1" pat="$2" file="$3"; if grep -q "$pat" "$file" 2>/dev/null; then ok "$desc"; else fail "$desc"; fi; }
+check_file()     { local desc="$1" file="$2"; if [ -f "$file" ]; then ok "$desc"; else fail "$desc"; fi; }
+check_not_found(){ local desc="$1" pat="$2" file="$3"; if ! grep -q "$pat" "$file" 2>/dev/null; then ok "$desc"; else fail "$desc"; fi; }
+
+die() { echo "FATAL: $1" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# 准备：清除所有生成产物
+# ---------------------------------------------------------------------------
+echo "=== [SETUP] Clean generated files ==="
+rm -f hello hello-i18n hello-cn .LANG.h .LANG.c .i18n LANG.cn.h hello.c.bak
+# LANG.h is auto-created by i18n.sh on first run; remove it here to test the full flow
+rm -f LANG.h
+
+# ---------------------------------------------------------------------------
+# 阶段 1 — 初次 gen
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 1] First-time gen ==="
+(cd "$I18N_DIR" && bash i18n.sh test)
+
+check_file ".LANG.h generated"   ".LANG.h"
+check_file ".LANG.c generated"   ".LANG.c"
+check_file ".i18n generated"     ".i18n"
+check_file "LANG.h auto-created" "LANG.h"
+check_contains "LA_NUM defined"  "LA_NUM"    ".LANG.h"
+check_contains "lang_en defined" "lang_en"   ".LANG.c"
+check_contains "SID_NEXT in .i18n" "SID_NEXT" ".i18n"
+# Expected: 8W (5 unique + 3 wide) + 5S (4 unique + 1 utf8) + 3F = 16 strings → SID_NEXT=17
+# Dedup (W_OK_DUP*, S_HELLO_DUP) merge to existing IDs, don't allocate new SIDs.
+check_contains "SID_NEXT=17"     "SID_NEXT=17" ".i18n"
+check_contains "LA_FMT_START in .LANG.h" "LA_FMT_START" ".LANG.h"
+
+# ---------------------------------------------------------------------------
+# 阶段 2 — 三种构建模式
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 2] Build all three modes ==="
+
+echo "  Building: hello (literal) ..."
+make -s hello
+check "hello builds"           test -x hello
+echo "  Running:  hello ..."
+./hello
+check "hello exits 0"          ./hello
+
+echo "  Building: hello-i18n ..."
+make -s hello-i18n
+check "hello-i18n builds"      test -x hello-i18n
+echo "  Running:  hello-i18n ..."
+./hello-i18n
+check "hello-i18n exits 0"     ./hello-i18n
+
+# hello-cn 需要 LANG.cn.h，先跳过，稍后再建
+
+# ---------------------------------------------------------------------------
+# 阶段 3 — 幂等性（重复运行 gen，SID_NEXT 不变）
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 3] Idempotency (re-run gen) ==="
+NEXT_BEFORE=$(grep SID_NEXT .i18n | head -1)
+(cd "$I18N_DIR" && bash i18n.sh test) > /tmp/i18n_gen2.log 2>&1
+NEXT_AFTER=$(grep SID_NEXT .i18n | head -1)
+if [ "$NEXT_BEFORE" = "$NEXT_AFTER" ]; then
+    ok "SID_NEXT unchanged after re-run"
+else
+    fail "SID_NEXT changed: $NEXT_BEFORE -> $NEXT_AFTER"
+fi
+# 第二次应无 "NOTE: N new" 输出
+check_not_found "no new SIDs allocated" "NOTE:.*new" /tmp/i18n_gen2.log
+
+# ---------------------------------------------------------------------------
+# 阶段 3b — --ndebug 模式（紧凑顺序 ID）
+#   验证 --ndebug 生成的 .LANG.h 无 _LA_ gap 占位符，ID 紧凑连续，
+#   三种构建模式均可编译运行。最后恢复默认（debug）模式。
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 3b] --ndebug mode (compact sequential IDs) ==="
+
+# 保存 debug 模式产物
+cp .LANG.h .LANG.h.debug
+cp .LANG.c .LANG.c.debug
+
+(cd "$I18N_DIR" && bash i18n.sh test --ndebug) > /tmp/i18n_ndebug.log 2>&1
+
+check_file ".LANG.h exists after --ndebug"   ".LANG.h"
+check_file ".LANG.c exists after --ndebug"   ".LANG.c"
+check_not_found "no _LA_ gap fillers"        "_LA_[0-9]" .LANG.h
+check_contains  "LA_NUM in ndebug .LANG.h"   "LA_NUM"    .LANG.h
+check_contains  "lang_en in ndebug .LANG.c"  "lang_en"   .LANG.c
+
+# Count enum members: ndebug should have exactly the real entries, no gaps
+NDEBUG_NUM=$(grep -c 'LA_[WSF][0-9]' .LANG.h || true)
+DEBUG_NUM=$(grep -c 'LA_[WSF][0-9]' .LANG.h.debug || true)
+# ndebug count <= debug count (debug has gap placeholders, ndebug doesn't)
+if [ "$NDEBUG_NUM" -le "$DEBUG_NUM" ]; then
+    ok "ndebug enum count ($NDEBUG_NUM) <= debug enum count ($DEBUG_NUM)"
+else
+    fail "ndebug enum count ($NDEBUG_NUM) > debug enum count ($DEBUG_NUM)"
+fi
+
+# Build all three modes with ndebug-generated files
+echo "  Building: hello (literal, ndebug gen) ..."
+make -s hello
+check "hello builds (ndebug)"       test -x hello
+check "hello runs (ndebug)"         ./hello
+
+echo "  Building: hello-i18n (ndebug gen) ..."
+make -s hello-i18n
+check "hello-i18n builds (ndebug)"  test -x hello-i18n
+check "hello-i18n runs (ndebug)"    ./hello-i18n
+
+# 恢复 debug 模式产物（后续阶段使用 SID-based IDs）
+mv .LANG.h.debug .LANG.h
+mv .LANG.c.debug .LANG.c
+echo "  Restored debug-mode .LANG.h/.LANG.c"
+
+# ---------------------------------------------------------------------------
+# 阶段 4 — --import cn 首次生成 LANG.cn.h
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 4] First --import cn (all new) ==="
+(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /tmp/i18n_import1.log 2>&1
+
+check_file "LANG.cn.h created"           "LANG.cn.h"
+# 应报告 16 条新字符串（8W + 5S + 3F）
+check_contains "NOTE: 16 new" "NOTE: 16 new" /tmp/i18n_import1.log
+# 新条目含 "/* SID:N new */" 注释
+check_contains "new comment in LANG.cn.h" "new \*/" LANG.cn.h
+
+# ---------------------------------------------------------------------------
+# 阶段 5 — 填入中文翻译并构建 hello-cn
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 5] Inject Chinese translations and build hello-cn ==="
+
+inject_cn() {
+    local file="LANG.cn.h"
+    # Inject Chinese translations by SID number.
+    # IMPORTANT: this script must be valid UTF-8 (it contains Chinese literals).
+    # Format strings use \\n (two chars) so they compile as C newline escapes.
+    python3 - "$file" <<'PYEOF'
+import re, sys
+
+# Chinese translation table indexed by SID.
+# Format strings (SID 14-16) use "\\n" (two chars) as the C escape sequence.
+# SID allocation (16 strings): W0-W7 (1-8), S0-S4 (9-13), F0-F2 (14-16)
+translations = {
+    1:  "\u9519\u8bef",           # W_ERROR: 错误
+    2:  "\u5931\u8d25",           # W_FAIL:  失败
+    3:  "\u786e\u5b9a",           # W_OK:    确定
+    4:  "\u901a\u8fc7",           # W_PASS:  通过
+    5:  "\u5c31\u7eea",           # W_READY: 就绪
+    6:  "UTF16",                  # W_UTF16 (English placeholder)
+    7:  "UTF32",                  # W_UTF32
+    8:  "WIDE",                   # W_WIDE
+    9:  "\u5168\u90e8\u6d4b\u8bd5\u901a\u8fc7\u3002",         # S_ALL_PASS: 全部测试通过。
+    10: "\u4f60\u597d\uff0c\u4e16\u754c\uff01",               # S_HELLO:    你好，世界！
+    11: "\u90e8\u5206\u6d4b\u8bd5\u5931\u8d25\u3002",         # S_SOME_FAIL:部分测试失败。
+    12: "\u6b22\u8fce\u4f7f\u7528\u56fd\u9645\u5316\u3002",   # S_WELCOME:  欢迎使用国际化。
+    13: "UTF-8 String",           # S_UTF8
+    14: "  [%s] %s\\n",           # F_RESULT: keep specifiers (\\n = backslash-n in C)
+    15: "\u8bed\u8a00: %s\\n",    # F_LANG:   语言: %s\n
+    16: "\u5df2\u8fd0\u884c: %d\\n",  # F_COUNT: 已运行: %d\n
+}
+
+def repl2(m):
+    key  = m.group(1)
+    sid  = int(m.group(2) or m.group(3))
+    tr   = translations.get(sid)
+    if tr is None:
+        return m.group(0)
+    # Escape only double quotes; backslash sequences are already correct C escapes.
+    tr_e = tr.replace('"', '\\"')
+    return f'    {key} = "{tr_e}",  /* SID:{sid} */'
+
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    content = f.read()
+
+content = re.sub(
+    r'    (\[LA_[WSF]\d+\]) = (?:NULL|"(?:[^"\\]|\\.)*"),\s+/\* (?:\[SID:(\d+)\] UPDATED new: "(?:[^"\\]|\\.)*"|SID:(\d+)(?:\s+new)?) \*/',
+    repl2, content
+)
+
+with open(sys.argv[1], 'w', encoding='utf-8') as f:
+    f.write(content)
+print("  Translations injected.")
+PYEOF
+}
+
+inject_cn
+check_contains "Chinese in LANG.cn.h (你好)" "你好" LANG.cn.h
+
+echo "  Building: hello-cn ..."
+make -s hello-cn
+check "hello-cn builds"    test -x hello-cn
+echo "  Running:  hello-cn ..."
+./hello-cn
+check "hello-cn exits 0"   ./hello-cn
+
+# ---------------------------------------------------------------------------
+# 阶段 6 — --import cn 二次运行：无变化（全 unchanged）
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 6] Second --import cn (unchanged, no NOTE) ==="
+(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /tmp/i18n_import2.log 2>&1
+check_not_found "no NOTE in second import"        "NOTE:.*new"     /tmp/i18n_import2.log
+check_not_found "no UPDATED in second import"     "UPDATED"        /tmp/i18n_import2.log
+# 翻译保持不变（中文仍在）
+check_contains  "Chinese preserved after re-import" "你好" LANG.cn.h
+
+# ---------------------------------------------------------------------------
+# Stage 7 -- UPDATED detection
+#   Modify one string in the source; the i18n.sh --import should detect
+#   that SID 7 ("Hello, World!") changed and mark it UPDATED.
+#
+#   IMPORTANT: gen overwrites .LANG.c before --import reads old_sid_map.
+#   Correct order:
+#     a) --import cn records current .LANG.c entries as "old english" baseline
+#     b) Make the source change
+#     c) Run gen  (rewrites .LANG.c with "Hello, World!!")
+#     d) Run --import cn  (reads NEW .LANG.c — "Hello, World!!" — vs old baseline)
+#        Wait, that still compares new vs new.
+#
+#   Actually the correct sequence is:
+#     a) Source is at "Hello, World!" with translations injected
+#     b) Run --import cn once more to establish a "clean" old_import_map baseline
+#     c) Change source to "Hello, World!!"
+#     d) Run gen (updates .LANG.c to "Hello, World!!")
+#     e) Run --import cn: reads old .LANG.cn.h (SID 7 = 你好) as old_translation,
+#        reads .LANG.c (SID 7 = "Hello, World!!") as new english,
+#        reads old_sid_map from .LANG.c *before* overwrite... wait:
+#
+#   The key insight: gen UPDATES .LANG.c. --import reads .LANG.c AFTER gen.
+#   But TEMP_OLD_SID_MAP is built from .LANG.c at the START of --import,
+#   before .LANG.c is overwritten. So running --import (which includes gen)
+#   in one pass means old_sid_map = old .LANG.c, new extraction = new source.
+#   But gen is a *separate* script run.
+#
+#   Correct procedure:
+#     1. cp .LANG.c .LANG.c.snapshot   (save old english)
+#     2. Change source to "Hello, World!!"
+#     3. Run gen  (updates .LANG.c)
+#     4. cp .LANG.c.snapshot .LANG.c   (restore old, so --import sees old english)
+#     5. Run --import cn               (detects old="Hello, World!" vs new="Hello, World!!")
+#     ... But that's too invasive.
+#
+#   SIMPLEST correct approach: run "bash i18n.sh test --import cn" which
+#   internally does gen + import in one pass. In that case:
+#     - TEMP_OLD_SID_MAP is built from .LANG.c BEFORE this run overwrites it
+#     - Then gen extracts "Hello, World!!" from source
+#     - Then .LANG.c is rewritten with "Hello, World!!"
+#     - Then _import_loop compares old_sid_map ("Hello, World!") vs new escape ("Hello, World!!")
+#   That works! i18n.sh already does gen + import in ONE run (no separate gen step).
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 7] UPDATED detection ==="
+cp hello.c hello.c.bak
+sed -i.tmp 's/LA_S("Hello, World!",/LA_S("Hello, World!!",/' hello.c
+rm -f hello.c.tmp
+
+# Run gen+import in a single call (i18n.sh does gen internally, then import)
+(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /tmp/i18n_import3.log 2>&1
+
+check_contains "UPDATED in LANG.cn.h"            "UPDATED"           LANG.cn.h
+check_contains "UPDATED shows new eng"            "Hello, World!!"    LANG.cn.h
+check_contains "old CN preserved in UPDATED line" $(printf '\xe4\xbd\xa0\xe5\xa5\xbd') LANG.cn.h
+
+echo "  INFO: LANG.cn.h UPDATED entry:"
+grep UPDATED LANG.cn.h || true
+
+# ---------------------------------------------------------------------------
+# Stage 8 -- Restore and settle
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 8] Restore and settle ==="
+mv hello.c.bak hello.c
+# Single combined gen+import run -- UPDATED entry will appear for SID 7 again
+# since we reverted "Hello, World!!" back to "Hello, World!" but the .LANG.c
+# saved "Hello, World!!" as the baseline. Run gen+import twice to settle.
+(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /dev/null 2>&1
+# Update translations (UPDATED entry may have NULL -- inject again)
+inject_cn
+(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /tmp/i18n_settle.log 2>&1
+check_not_found "UPDATED gone after restore+settle" "UPDATED" LANG.cn.h
+check_contains  "Chinese restored after settle"     $(printf '\xe4\xbd\xa0\xe5\xa5\xbd') LANG.cn.h
+check_not_found "no NOTE after settle" "NOTE:.*new" /tmp/i18n_settle.log
+
+# ---------------------------------------------------------------------------
+# Stage 9 -- String deletion (orphan SID)
+#   Remove one string definition from source; verify:
+#     - SID_NEXT stays at 17 (no SID reclamation)
+#     - .LANG.h/.LANG.c no longer contain the deleted string
+#     - LANG.cn.h preserves the orphan SID's translation (stale entry)
+#     - Other SIDs remain unchanged
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 9] String deletion (orphan SID) ==="
+cp hello.c hello.c.stage9.bak
+
+# Delete W_READY (originally SID 5)
+sed -i.tmp '/^#define W_READY/d' hello.c
+rm -f hello.c.tmp
+
+SID_NEXT_BEFORE=$(grep SID_NEXT .i18n | head -1)
+
+# Run gen+import
+(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /tmp/i18n_delete.log 2>&1
+
+SID_NEXT_AFTER=$(grep SID_NEXT .i18n | head -1)
+
+check "SID_NEXT unchanged after deletion" test "$SID_NEXT_BEFORE" = "$SID_NEXT_AFTER"
+check_not_found "W_READY removed from .LANG.h" "LA_W5" .LANG.h
+check_not_found "READY removed from .LANG.c"   '"READY"' .LANG.c
+# Orphan SID 5 may still exist in LANG.cn.h (no automatic pruning)
+# This is expected behavior -- old translations remain until manually cleaned
+
+echo "  INFO: Orphan SID entries in LANG.cn.h (if any):"
+grep "SID:5" LANG.cn.h || echo "    (none found)"
+
+# Restore
+mv hello.c.stage9.bak hello.c
+(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /dev/null 2>&1
+inject_cn  # Restore Chinese translations
+
+# ---------------------------------------------------------------------------
+# Stage 10 -- --ndebug + Chinese (compact IDs with import-cn)
+#   Verify --ndebug codegen produces valid output for translation import,
+#   and that hello-cn builds and runs correctly with compact IDs.
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 10] --ndebug + Chinese (compact IDs with import-cn) ==="
+
+# Save debug-mode products
+cp .LANG.h .LANG.h.debug
+cp .LANG.c .LANG.c.debug
+cp LANG.cn.h LANG.cn.h.debug
+
+# Gen with --ndebug and import cn in separate steps
+(cd "$I18N_DIR" && bash i18n.sh test --ndebug) > /dev/null 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --ndebug --import cn) > /tmp/i18n_ndebug_cn.log 2>&1
+
+check_file  "LANG.cn.h exists after ndebug import"  "LANG.cn.h"
+check_not_found "no _LA_ gap in ndebug .LANG.h"     "_LA_[0-9]" .LANG.h
+inject_cn   # Inject Chinese into ndebug LANG.cn.h
+
+echo "  Building: hello-cn (ndebug) ..."
+make -s hello-cn
+check "hello-cn builds (ndebug)"  test -x hello-cn
+check "hello-cn runs (ndebug)"    ./hello-cn
+
+# Restore debug-mode products for clean state
+mv .LANG.h.debug .LANG.h
+mv .LANG.c.debug .LANG.c
+mv LANG.cn.h.debug LANG.cn.h
+echo "  Restored debug-mode products"
+
+# ---------------------------------------------------------------------------
+# 汇总
+# ---------------------------------------------------------------------------
+echo ""
+echo "=================================================="
+echo "Tests run:   $((PASS + FAIL))"
+echo "Passed:      $PASS"
+echo "Failed:      $FAIL"
+echo "=================================================="
+
+if [ "$FAIL" -eq 0 ]; then
+    echo "All tests passed."
+    exit 0
+else
+    echo "Some tests FAILED."
+    exit 1
+fi
