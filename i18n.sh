@@ -758,8 +758,16 @@ else
         efiles[sid] = $5; eparams[sid] = $6
     }
     END {
+        cur_type = ""
         for (s = 1; s <= max_sid; s++) {
             if (s in type) {
+                if (type[s] != cur_type) {
+                    if (cur_type != "") printf "\n"
+                    cur_type = type[s]
+                    if (cur_type == "W") printf "    /* Words (LA_W) */\n"
+                    else if (cur_type == "S") printf "    /* Strings (LA_S) */\n"
+                    else if (cur_type == "F") printf "    /* Formats (LA_F) */\n"
+                }
                 if (type[s] == "F" && eparams[s] != "")
                     cmt = "/* \"" estr[s] "\" (" eparams[s] ")  [" efiles[s] "] */"
                 else

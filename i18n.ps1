@@ -700,9 +700,19 @@ if ($NdebugMode) {
     if ($formatCount -gt 0) { $hLines.Add("") }
 } else {
     # Debug: 按 SID 顺序排列，空洞用占位符填充
+    $curType = ""
     for ($s = 1; $s -le $maxSid; $s++) {
         if ($enumData.ContainsKey($s)) {
             $e = $enumData[$s]
+            if ($e.Type -ne $curType) {
+                if ($curType -ne "") { $hLines.Add("") }
+                $curType = $e.Type
+                switch ($curType) {
+                    "W" { $hLines.Add("    /* Words (LA_W) */") }
+                    "S" { $hLines.Add("    /* Strings (LA_S) */") }
+                    "F" { $hLines.Add("    /* Formats (LA_F) */") }
+                }
+            }
             if ($e.Type -eq "F" -and $e.Params -ne "") {
                 $hLines.Add("    $($e.IdName),  /* `"$($e.Str)`" ($($e.Params))  [$($e.Files)] */")
             } else {
