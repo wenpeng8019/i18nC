@@ -308,14 +308,17 @@ function Get-CompilerFlagsForFile {
 # ============================================================================
 
 $markerContent = @'
+/* 从 variadic args 中提取 SID（第2个参数），缺省为 0 */
+#define _I18N_SID_GET(_id, _sid, ...) _sid
+#define _I18N_SID(...) _I18N_SID_GET(__VA_ARGS__, 0, 0)
 #ifndef LA_W
-#define LA_W(WD, ID, SID) _I18NW_ WD _I18NSID_ SID _I18NW_END_
+#define LA_W(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NW_END_
 #endif
 #ifndef LA_S
-#define LA_S(STR, ID, SID) _I18NS_ STR _I18NSID_ SID _I18NS_END_
+#define LA_S(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NS_END_
 #endif
 #ifndef LA_F
-#define LA_F(FMT, ID, SID, ...) _I18NF_ FMT _I18NSID_ SID _I18NF_END_
+#define LA_F(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NF_END_
 #endif
 '@
 [System.IO.File]::WriteAllText($TempMarkerH, $markerContent, [System.Text.UTF8Encoding]::new($false))
