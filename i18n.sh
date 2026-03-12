@@ -89,6 +89,10 @@
 # 1. 完全一致：不做任何转换
 #    格式化字符串必须完全匹配才能归并（包括大小写和空格）
 #
+# 2. 自动前缀：如果字符串不包含 % 格式符，自动添加 "% " 前缀
+#    LA_F("hello world", LA_F1) -> 输出到 .LANG.c 中变为 "% hello world"
+#    这让 print() 将其当作普通字符串直接输出，避免格式化解析错误
+#
 # ============================================================================
 # 工作流程
 # ============================================================================
@@ -264,6 +268,16 @@ else
     TEMP_OLD_IMPORT_MAP=$(mktemp)
     TEMP_ENUM_DATA=$(mktemp)
 fi
+
+# 处理格式字符串：如果不包含 % 则在前面添加 "% " 前缀
+# 这样 print() 会将其当作普通字符串直接输出，而非格式化解析
+_fmt_ensure_prefix() {
+    local _s="$1"
+    case "$_s" in
+        *%*) printf '%s' "$_s" ;;
+        *)   printf '%s' "% $_s" ;;
+    esac
+}
 
 cleanup() {
     if [ "$DEBUG_MODE" -eq 0 ]; then
@@ -689,8 +703,10 @@ if [ "$format_count" -gt 0 ]; then
         fi
         [ -z "$first_fmt_id" ] && first_fmt_id="$id_name"
         params=$(printf '%s' "$str" | grep -o '%[sdifuxXclu]' 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)
+        # 如果 LA_F 字符串不包含 % 则添加 "% " 前缀（让 print() 直接输出）
+        str_out=$(_fmt_ensure_prefix "$str")
         printf 'F|%s|%s|%s\n' "$key" "$id_name" "$entry_sid" >> "$TEMP_MAP"
-        printf 'F|%s|%s|%s|%s|%s\n' "$id_name" "$entry_sid" "$str" "$files_formatted" "$params" >> "$TEMP_ENUM_DATA"
+        printf 'F|%s|%s|%s|%s|%s\n' "$id_name" "$entry_sid" "$str_out" "$files_formatted" "$params" >> "$TEMP_ENUM_DATA"
         [ "$entry_sid" -gt "$max_sid" ] && max_sid=$entry_sid
         sid=$((sid + 1))
     done < "$TEMP_FORMATS"
@@ -881,7 +897,9 @@ fi
 # 格式化
 if [ "$format_count" -gt 0 ]; then
     while IFS='|' read -r type key str files; do
-        escaped=$(printf '%s' "$str" | sed 's/"/\\"/g')
+        # 如果 LA_F 字符串不包含 % 则添加 "% " 前缀
+        str_out=$(_fmt_ensure_prefix "$str")
+        escaped=$(printf '%s' "$str_out" | sed 's/"/\\"/g')
         id_name=$(_I18N_KEY="$key" awk -F'|' -v t="F" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $3; exit}' "$TEMP_MAP")
         entry_sid=$(_I18N_KEY="$key" awk -F'|' -v t="F" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $4; exit}' "$TEMP_MAP")
         printf '    [%s] = "%s",  /* SID:%s */\n' "${id_name:-LA_F0}" "$escaped" "${entry_sid:-0}" >> "$OUTPUT_C"
@@ -963,7 +981,9 @@ EOF
 
     if [ "$format_count" -gt 0 ]; then
         while IFS='|' read -r type key str files; do
-            printf '%s\n' "$str" >> "$OUTPUT_LANG_EN"
+            # 如果 LA_F 字符串不包含 % 则添加 "% " 前缀
+            str_out=$(_fmt_ensure_prefix "$str")
+            printf '%s\n' "$str_out" >> "$OUTPUT_LANG_EN"
         done < "$TEMP_FORMATS"
     fi
 fi
@@ -1074,7 +1094,9 @@ EOF
     # 格式化
     if [ "$format_count" -gt 0 ]; then
         while IFS='|' read -r type key str files; do
-            escaped=$(printf '%s' "$str" | sed 's/"/\\"/g')
+            # 如果 LA_F 字符串不包含 % 则添加 "% " 前缀
+            str_out=$(_fmt_ensure_prefix "$str")
+            escaped=$(printf '%s' "$str_out" | sed 's/"/\\"/g')
             _import_loop "F" "$key" "$escaped"
         done < "$TEMP_FORMATS"
     fi

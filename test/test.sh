@@ -55,9 +55,9 @@ check_file "LANG.h auto-created" "LANG.h"
 check_contains "LA_NUM defined"  "LA_NUM"    ".LANG.h"
 check_contains "lang_en defined" "lang_en"   ".LANG.c"
 check_contains "SID_NEXT in .i18n" "SID_NEXT" ".i18n"
-# Expected: 8W (5 unique + 3 wide) + 5S (4 unique + 1 utf8) + 3F = 16 strings → SID_NEXT=17
+# Expected: 8W (5 unique + 3 wide) + 5S (4 unique + 1 utf8) + 4F (3+1 plain) = 17 strings → SID_NEXT=18
 # Dedup (W_OK_DUP*, S_HELLO_DUP) merge to existing IDs, don't allocate new SIDs.
-check_contains "SID_NEXT=17"     "SID_NEXT=17" ".i18n"
+check_contains "SID_NEXT=18"     "SID_NEXT=18" ".i18n"
 check_contains "LA_FMT_START in .LANG.h" "LA_FMT_START" ".LANG.h"
 
 # ---------------------------------------------------------------------------
@@ -152,8 +152,8 @@ echo "=== [Stage 4] First --import cn (all new) ==="
 (cd "$I18N_DIR" && bash i18n.sh test --import cn) > /tmp/i18n_import1.log 2>&1
 
 check_file "LANG.cn.h created"           "LANG.cn.h"
-# 应报告 16 条新字符串（8W + 5S + 3F）
-check_contains "NOTE: 16 new" "NOTE: 16 new" /tmp/i18n_import1.log
+# 应报告 17 条新字符串（8W + 5S + 4F）
+check_contains "NOTE: 17 new" "NOTE: 17 new" /tmp/i18n_import1.log
 # 新条目含 "/* SID:N new */" 注释
 check_contains "new comment in LANG.cn.h" "new \*/" LANG.cn.h
 

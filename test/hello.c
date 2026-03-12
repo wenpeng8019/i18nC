@@ -77,6 +77,9 @@
 #define F_LANG    LA_F("Language: %s\n", LA_F1, 15)
 #define F_COUNT   LA_F("Tests run: %d\n",LA_F2, 16)
 
+/* LA_F without % -- i18n.sh should auto-add "% " prefix in generated code */
+#define F_PLAIN   LA_F("hello world",    LA_F3, 17)
+
 /* Deduplication tests -- these should merge to existing IDs */
 #define W_OK_DUP1   LA_W("OK",    LA_W2, 3)  /* Should merge to LA_W3 (same as W_OK) */
 #define W_OK_DUP2   LA_W("ok",    LA_W2, 3)  /* LA_W trims+lowercase: ok -> OK -> LA_W3 */
@@ -117,6 +120,7 @@ static void test_literals(void)
     CHECK("S_WELCOME contains i18n",     strstr(S_WELCOME,"i18n") != NULL);
     CHECK("F_RESULT contains %s",        strstr(F_RESULT, "%s")   != NULL);
     CHECK("F_COUNT  contains %d",        strstr(F_COUNT,  "%d")   != NULL);
+    CHECK("F_PLAIN == \"hello world\"",  strcmp(F_PLAIN,  "hello world") == 0);
 #else
     /* I18N mode: lang_init() called in main(); verify non-empty and English */
     CHECK("W_OK    non-empty",  W_OK[0]     != '\0');
@@ -127,6 +131,8 @@ static void test_literals(void)
     CHECK("W_OK    == \"OK\"",  strcmp(W_OK,    "OK")              == 0);
     CHECK("S_HELLO == \"Hello, World!\"",
                                 strcmp(S_HELLO, "Hello, World!")   == 0);
+    /* LA_F without % should have "% " prefix added by i18n.sh */
+    CHECK("F_PLAIN == \"% hello world\"", strcmp(F_PLAIN, "% hello world") == 0);
 #endif
 
     /* Wide/Unicode string prefix tests (u"", L"", U"", u8"") */
@@ -150,9 +156,9 @@ static void test_literals(void)
  * Test 2 -- lang_load_tx (I18N mode only)
  * Load a Chinese translation from an in-memory text block and verify it.
  * String order must exactly match .LANG.c lang_en[]:
- *   W0..W7  (W_ERROR, W_FAIL, W_OK, W_PASS, W_READY, W_UTF16, W_WIDE, W_UTF32)
- *   S0..S4  (S_ALL_PASS, S_HELLO, S_SOME_FAIL, S_WELCOME, S_UTF8)
- *   F0..F2  (F_RESULT, F_LANG, F_COUNT)
+ *   W1..W8  (ERROR, FAIL, OK, PASS, READY, UTF16, UTF32, WIDE)
+ *   S9..S13 (All tests passed, Hello World, Some tests FAILED, UTF-8 String, Welcome to i18n)
+ *   F14..F17 (RESULT, LANG, COUNT, PLAIN)
  * Format strings must keep identical specifiers or lang_load_tx rejects them.
  * ============================================================================ */
 #ifdef I18N_ENABLED
@@ -162,22 +168,23 @@ static void test_load_tx(void)
 
     /* UTF-8 Chinese translation text (hex-escaped to keep source ASCII) */
     const char *cn_tx =
-        "\xe9\x94\x99\xe8\xaf\xaf\n"                   /* W0: ERROR */
-        "\xe5\xa4\xb1\xe8\xb4\xa5\n"                   /* W1: FAIL  */
-        "\xe7\xa1\xae\xe5\xae\x9a\n"                   /* W2: OK    */
-        "\xe9\x80\x9a\xe8\xbf\x87\n"                   /* W3: PASS  */
-        "\xe5\xb0\xb1\xe7\xbb\xaa\n"                   /* W4: READY */
-        "UTF16\n"                                      /* W5: UTF16 */
-        "UTF32\n"                                      /* W6: UTF32 */
-        "WIDE\n"                                       /* W7: WIDE  */
-        "\xe5\x85\xa8\xe9\x83\xa8\xe6\xb5\x8b\xe8\xaf\x95\xe9\x80\x9a\xe8\xbf\x87\xe3\x80\x82\n"  /* S0: All tests passed */
-        "\xe4\xbd\xa0\xe5\xa5\xbd\xef\xbc\x8c\xe4\xb8\x96\xe7\x95\x8c\xef\xbc\x81\n"              /* S1: Hello, World! */
-        "\xe9\x83\xa8\xe5\x88\x86\xe6\xb5\x8b\xe8\xaf\x95\xe5\xa4\xb1\xe8\xb4\xa5\xe3\x80\x82\n" /* S2: Some tests FAILED */
-        "\xe6\xac\xa2\xe8\xbf\x8e\xe4\xbd\xbf\xe7\x94\xa8\xe5\x9b\xbd\xe9\x99\x85\xe5\x8c\x96\xe3\x80\x82\n" /* S3: Welcome to i18n */
-        "UTF-8 String\n"                               /* S4: UTF-8 String */
-        "  [%s] %s\n"              /* F0: RESULT -- keep specifiers identical */
-        "\xe8\xaf\xad\xe8\xa8\x80: %s\n"               /* F1: LANG   */
-        "\xe5\xb7\xb2\xe8\xbf\x90\xe8\xa1\x8c: %d\n";  /* F2: COUNT  */
+        "\xe9\x94\x99\xe8\xaf\xaf\n"                   /* W1: ERROR */
+        "\xe5\xa4\xb1\xe8\xb4\xa5\n"                   /* W2: FAIL  */
+        "\xe7\xa1\xae\xe5\xae\x9a\n"                   /* W3: OK    */
+        "\xe9\x80\x9a\xe8\xbf\x87\n"                   /* W4: PASS  */
+        "\xe5\xb0\xb1\xe7\xbb\xaa\n"                   /* W5: READY */
+        "UTF16\n"                                      /* W6: UTF16 */
+        "UTF32\n"                                      /* W7: UTF32 */
+        "WIDE\n"                                       /* W8: WIDE  */
+        "\xe5\x85\xa8\xe9\x83\xa8\xe6\xb5\x8b\xe8\xaf\x95\xe9\x80\x9a\xe8\xbf\x87\xe3\x80\x82\n"  /* S9: All tests passed */
+        "\xe4\xbd\xa0\xe5\xa5\xbd\xef\xbc\x8c\xe4\xb8\x96\xe7\x95\x8c\xef\xbc\x81\n"              /* S10: Hello, World! */
+        "\xe9\x83\xa8\xe5\x88\x86\xe6\xb5\x8b\xe8\xaf\x95\xe5\xa4\xb1\xe8\xb4\xa5\xe3\x80\x82\n" /* S11: Some tests FAILED */
+        "UTF-8 String\n"                               /* S12: UTF-8 String */
+        "\xe6\xac\xa2\xe8\xbf\x8e\xe4\xbd\xbf\xe7\x94\xa8\xe5\x9b\xbd\xe9\x99\x85\xe5\x8c\x96\xe3\x80\x82\n" /* S13: Welcome to i18n */
+        "  [%s] %s\n"              /* F14: RESULT -- keep specifiers identical */
+        "\xe8\xaf\xad\xe8\xa8\x80: %s\n"               /* F15: LANG   */
+        "\xe5\xb7\xb2\xe8\xbf\x90\xe8\xa1\x8c: %d\n"   /* F16: COUNT  */
+        "% hello world\n";                             /* F17: PLAIN -- no format specs */
 
     bool ok = lang_load_tx(cn_tx);
     CHECK("lang_load_tx succeeds",                ok);
@@ -190,10 +197,11 @@ static void test_load_tx(void)
     const char *bad_tx =
         "e1\nf2\ng3\nh4\ni5\n"
         "UTF16\nUTF32\nWIDE\n"
-        "all-pass\nhello\nsome-fail\nwelcome\nUTF-8\n"
+        "all-pass\nhello\nsome-fail\nUTF-8\nwelcome\n"
         "  [%s] %s\n"
         "lang: %s\n"
-        "count: %s\n";   /* wrong: %d -> %s — 16 entries matching LA_NUM */
+        "count: %s\n"   /* wrong: %d -> %s */
+        "% hello world\n";  /* 17 entries matching LA_NUM */
     bool bad_ok = lang_load_tx(bad_tx);
     CHECK("bad format spec rejected", !bad_ok);
 
