@@ -116,13 +116,13 @@ enum {
 /* 包含自动生成的语言 ID 定义（必须在 LA_PREDEFINED 之后）*/
 #include ".LANG.h"
 
+#define LA_RID lang_rid
+extern int lang_rid;
+
 #include <i18n.h>
 
 /* 语言初始化函数（自动生成，请勿修改）*/
-static inline int lang_init(void) {
-    LA_RID = lang_def(lang_en, sizeof(lang_en) / sizeof(lang_en[0]), LA_FMT_START);
-    return LA_RID;
-}
+void lang_init(void);
 
 #endif /* LANG_H_ */
 '@
@@ -764,13 +764,6 @@ if ($formatCount -gt 0) {
     $hLines.Add("#define LA_FMT_START LA_NUM")
 }
 $hLines.Add("")
-$hLines.Add("/* 字符串表 */")
-$hLines.Add("extern const char* lang_en[LA_NUM];")
-$hLines.Add("")
-$hLines.Add("/* 语言实例 ID（多实例支持） */")
-$hLines.Add("#define LA_RID lang_rid")
-$hLines.Add("extern int lang_rid;")
-$hLines.Add("")
 $hLines.Add("#endif /* LANG_H__ */")
 
 [System.IO.File]::WriteAllLines($OutputH, $hLines, [System.Text.UTF8Encoding]::new($false))
@@ -795,12 +788,12 @@ $cLines.Add("/*")
 $cLines.Add(" * Auto-generated language strings")
 $cLines.Add(" */")
 $cLines.Add("")
-$cLines.Add("#include `".LANG.h`"")
+$cLines.Add("#include `"LANG.h`"")
 $cLines.Add("")
 $cLines.Add("int lang_rid;")
 $cLines.Add("")
 $cLines.Add("/* 字符串表 */")
-$cLines.Add("const char* lang_en[LA_NUM] = {")
+$cLines.Add("static const char* s_lang_en[LA_NUM] = {")
 
 function Escape-CString([string]$s) {
     return $s.Replace('"', '\"')
@@ -841,6 +834,11 @@ foreach ($line in $formatLines) {
 }
 
 $cLines.Add("};")
+$cLines.Add("")
+$cLines.Add("/* 语言初始化函数（自动生成，请勿修改）*/")
+$cLines.Add("void lang_init(void) {")
+$cLines.Add("    LA_RID = lang_def(s_lang_en, sizeof(s_lang_en) / sizeof(s_lang_en[0]), LA_FMT_START);")
+$cLines.Add("}")
 [System.IO.File]::WriteAllLines($OutputC, $cLines, [System.Text.UTF8Encoding]::new($false))
 
 # ============================================================================
@@ -905,7 +903,7 @@ if ($ImportSuffix -ne "") {
     $iLines.Add(" * Auto-generated language strings")
     $iLines.Add(" */")
     $iLines.Add("")
-    $iLines.Add("#include `".LANG.h`"")
+    $iLines.Add("#include `"LANG.h`"")
     $iLines.Add("")
     $iLines.Add("/* Embedded $ImportSuffix language table */")
     $iLines.Add("static const char* s_lang_${ImportSuffix}[LA_NUM] = {")

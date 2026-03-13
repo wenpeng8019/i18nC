@@ -229,13 +229,13 @@ enum {
 /* 包含自动生成的语言 ID 定义（必须在 LA_PREDEFINED 之后）*/
 #include ".LANG.h"
 
+#define LA_RID lang_rid
+extern int lang_rid;
+
 #include <i18n.h>
 
 /* 语言初始化函数（自动生成，请勿修改）*/
-static inline int lang_init(void) {
-    LA_RID = lang_def(lang_en, sizeof(lang_en) / sizeof(lang_en[0]), LA_FMT_START);
-    return LA_RID;
-}
+void lang_init(void);
 
 #endif /* LANG_H_ */
 EOF
@@ -835,13 +835,6 @@ EOF
 fi
 
 cat >> "$OUTPUT_H" <<'EOF'
-/* 字符串表 */
-extern const char* lang_en[LA_NUM];
-
-/* 语言实例 ID（多实例支持） */
-#define LA_RID lang_rid
-extern int lang_rid;
-
 #endif /* LANG_H__ */
 EOF
 
@@ -851,12 +844,12 @@ cat > "$OUTPUT_C" <<EOF
  * Auto-generated language strings
  */
 
-#include ".LANG.h"
+#include "LANG.h"
 
 int lang_rid;
 
 /* 字符串表 */
-const char* lang_en[LA_NUM] = {
+static const char* s_lang_en[LA_NUM] = {
 EOF
 
 # 提取 LANG.h 中的预定义项（如果存在）
@@ -923,8 +916,13 @@ if [ "$format_count" -gt 0 ]; then
     done < "$TEMP_FORMATS"
 fi
 
-cat >> "$OUTPUT_C" <<EOF
+cat >> "$OUTPUT_C" <<'EOF'
 };
+
+/* 语言初始化函数（自动生成，请勿修改）*/
+void lang_init(void) {
+    LA_RID = lang_def(s_lang_en, sizeof(s_lang_en) / sizeof(s_lang_en[0]), LA_FMT_START);
+}
 EOF
 
 # 生成 lang.en 文本文件（仅在指定 --export 选项时）
@@ -1065,7 +1063,7 @@ if [ -n "$IMPORT_SUFFIX" ]; then
  * Auto-generated language strings
  */
 
-#include ".LANG.h"
+#include "LANG.h"
 
 /* Embedded ${IMPORT_SUFFIX} language table */
 static const char* s_lang_${IMPORT_SUFFIX}[LA_NUM] = {
