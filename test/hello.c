@@ -10,7 +10,7 @@
  *   hello       -- literal mode: macros return English strings directly,
  *                  no i18n.c linked (zero-dependency demo)
  *   hello-i18n  -- I18N mode: lang_str() looks up table at runtime
- *   hello-cn    -- I18N + embedded Chinese: loads lang_cn[] from LANG.cn.h
+ *   hello-cn    -- I18N + embedded Chinese: loads s_lang_cn[] from LANG.cn.h
  *
  * Toolchain role (see test.sh):
  *   i18n.sh test           -- scan this file, generate .LANG.h / .LANG.c / .i18n
@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 #ifdef I18N_ENABLED
 /*
@@ -39,7 +40,7 @@
 
 /* Optional: embed a static translation (defined when building hello-cn) */
 #  ifdef USE_CN
-#    include "LANG.cn.h"   /* provides: static const char* lang_cn[LA_NUM] */
+#    include "LANG.cn.h"   /* provides: static const char* s_lang_cn[LA_NUM] and lang_cn() */
 #  endif
 #else
 /* Literal mode: only the base header is needed; macros expand to string literals */
@@ -186,8 +187,8 @@ static void test_load_tx(void)
         "\xe5\xb7\xb2\xe8\xbf\x90\xe8\xa1\x8c: %d\n"   /* F16: COUNT  */
         "% hello world\n";                             /* F17: PLAIN -- no format specs */
 
-    bool ok = lang_load_tx(cn_tx);
-    CHECK("lang_load_tx succeeds",                ok);
+    int ok = lang_load_tx(LA_RID, cn_tx);
+    CHECK("lang_load_tx succeeds",                ok == 0);
     /* After loading CN, W_OK must differ from "OK" */
     CHECK("W_OK != \"OK\" after CN load",  strcmp(W_OK, "OK") != 0);
     CHECK("W_OK  non-empty after CN load",  W_OK[0]           != '\0');
@@ -202,32 +203,32 @@ static void test_load_tx(void)
         "lang: %s\n"
         "count: %s\n"   /* wrong: %d -> %s */
         "% hello world\n";  /* 17 entries matching LA_NUM */
-    bool bad_ok = lang_load_tx(bad_tx);
-    CHECK("bad format spec rejected", !bad_ok);
+    int bad_ok = lang_load_tx(LA_RID, bad_tx);
+    CHECK("bad format spec rejected", bad_ok != 0);
 
     /* Restore English table */
-    lang_load(lang_en, LA_NUM);
+    lang_load(LA_RID, lang_en, LA_NUM);
     CHECK("after reload: W_OK == \"OK\"", strcmp(W_OK, "OK") == 0);
 }
 #endif  /* I18N_ENABLED */
 
 /* ============================================================================
- * Test 3 -- static embedded lang_cn[] (USE_CN build only)
+ * Test 3 -- static embedded s_lang_cn[] (USE_CN build only)
  * ============================================================================ */
 #if defined(I18N_ENABLED) && defined(USE_CN)
 static void test_static_cn(void)
 {
-    printf("\n[Test 3] static embedded lang_cn[]\n");
+    printf("\n[Test 3] static embedded s_lang_cn[]\n");
 
-    bool ok = lang_load(lang_cn, LA_NUM);
-    CHECK("lang_load(lang_cn) succeeds",          ok);
+    int ok = lang_cn();  /* calls lang_load(LA_RID, s_lang_cn, LA_NUM) */
+    CHECK("lang_cn() succeeds",          ok == 0);
     CHECK("W_OK  != \"OK\" in CN mode",   strcmp(W_OK, "OK")       != 0);
     CHECK("W_OK  non-empty",              W_OK[0]                  != '\0');
     CHECK("S_HELLO != English",           strcmp(S_HELLO, "Hello, World!") != 0);
     CHECK("F_COUNT has %%d",              strstr(F_COUNT, "%d")    != NULL);
 
     /* Restore English */
-    lang_load(lang_en, LA_NUM);
+    lang_load(LA_RID, lang_en, LA_NUM);
     CHECK("restored: W_OK == \"OK\"",     strcmp(W_OK, "OK")        == 0);
 }
 #endif

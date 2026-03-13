@@ -66,10 +66,14 @@ target_include_directories(my_target PRIVATE ${PROJECT_SOURCE_DIR}/i18n)
 
 ```c
 // In your main() or init function:
-#include ".LANG.h"   // auto-generated
+#include "LANG.h"   // user init, includes .LANG.h
 
-lang_def(lang_en, LA_NUM, LA_FMT_START);   // register default (English) table
-lang_load_fp(fopen("lang.zh", "r"));       // optionally load a translation
+lang_init();  // registers lang_en[] and sets LA_RID
+
+// optionally load a translation:
+lang_load_fp(LA_RID, fopen("lang.zh", "r"));
+// or use embedded translation:
+lang_cn();    // calls lang_load(LA_RID, s_lang_cn, LA_NUM)
 ```
 
 ---
@@ -138,13 +142,15 @@ add_custom_target(i18n_gen
 cp p2p_server/lang.en p2p_server/lang.zh
 $EDITOR p2p_server/lang.zh
 
-# 3. 导入 — 生成包含 lang_zh[] 表的 LANG.zh.h
+# 3. 导入 — 生成包含 s_lang_zh[] 表和 lang_zh() 函数的 LANG.zh.h
 ./i18n/i18n.sh p2p_server --import zh
 # -> p2p_server/LANG.zh.h
 
 # 4. 运行时激活
-lang_load_fp(fopen("lang.zh", "r"));
-// 或：lang_load(lang_zh, LA_NUM);   （静态嵌入二进制）
+lang_load_fp(LA_RID, fopen("lang.zh", "r"));
+// 或使用静态嵌入：
+#include "LANG.zh.h"
+lang_zh();   // 调用 lang_load(LA_RID, s_lang_zh, LA_NUM)
 ```
 
 #### --import 三种情况
@@ -169,23 +175,35 @@ lang_load_fp(fopen("lang.zh", "r"));
 ## 运行时 API（`i18n.h` / `i18n.c`）
 
 ```c
-// 注册默认（英文）字符串表 — 启动时调用一次
-bool lang_def(const char* lang_table[], size_t num_lines, size_t format_start);
+// 注册默认（英文）字符串表 — 启动时调用一次，返回语言实例 ID
+int  lang_def(const char* lang_table[], size_t num_lines, size_t format_start);
 
 // 加载已翻译的表（静态指针 — 调用方负责生命周期）
-bool lang_load(const char* lang_table[], size_t num_lines);
+int  lang_load(int la_id, const char* lang_table[], size_t num_lines);
 
 // 从文本文件加载（每行一个字符串，# 开头为注释）
-bool lang_load_fp(FILE *fp);
+int  lang_load_fp(int la_id, FILE *fp);
 
 // 从内存字符串加载（格式与文本文件相同）
-bool lang_load_tx(const char* text);
+int  lang_load_tx(int la_id, const char* text);
 
 // 按 ID 查找字符串（I18N_ENABLED 时由 LA_W/S/F 内部调用）
-const char* lang_str(unsigned id);
+const char* lang_str(int la_id, unsigned id);
 ```
 
-`lang_load_fp` 和 `lang_load_tx` 会将翻译版本的格式符（`%s`、`%d` 等）与默认表逐一校验——格式符类型或数量不匹配的翻译会被拒绝。
+### 多实例支持
+
+每次调用 `lang_def()` 返回一个唯一的 `la_id`（语言实例 ID），
+后续 `lang_load*` 和 `lang_str` 调用需传入此 ID。
+
+生成的 `LANG.h` 会自动处理这些细节：
+- `lang_init()` 调用 `lang_def()` 并将返回的 `la_id` 存入 `LA_RID`
+- `LA_W/S/F` 宏内部使用 `LA_RID` 调用 `lang_str()`
+- `lang_{suffix}()` 辅助函数（如 `lang_cn()`）调用 `lang_load(LA_RID, ...)`
+
+这允许同一进程中多个项目各自维护独立的语言表，互不干扰。
+
+`lang_load_fp` 和 `lang_load_tx` 会将翻译版本的格式符（`%s`、`%d` 等）与默认表逐一校验——格式符类型或数量不匹配的翻译会被拒绝（返回 -1）。
 
 ---
 
@@ -198,30 +216,38 @@ enum {
     LA_PRED = LA_PREDEFINED,   // 基础 ID（默认 -1；可通过 -DLA_PREDEFINED=N 重定义）
 
     /* Words */
-    LA_W0,  /* "disabled"  [server.c] */
-    LA_W1,  /* "enabled"   [server.c] */
+    LA_W1,  /* "disabled"  [server.c] */
+    LA_W2,  /* "enabled"   [server.c] */
 
     /* Strings */
-    LA_S0,  /* "Server started"  [server.c] */
+    LA_S3,  /* "Server started"  [server.c] */
 
     /* Formats */
-    LA_F0,  /* "Port %d\n" (%d)  [server.c] */
+    LA_F4,  /* "Port %d\n" (%d)  [server.c] */
 
-    LA_NUM = 42
+    LA_NUM
 };
 
-#define LA_FMT_START LA_F0
+#define LA_FMT_START LA_F4
 extern const char* lang_en[LA_NUM];
+
+/* 语言实例 ID（多实例支持） */
+#define LA_RID lang_rid
+extern int lang_rid;
 ```
 
 ### `.LANG.c`（含 SID 注释）
 
 ```c
+#include ".LANG.h"
+
+int lang_rid;  // 语言实例 ID
+
 const char* lang_en[LA_NUM] = {
-    [LA_W0] = "disabled",       /* SID:1 */
-    [LA_W1] = "enabled",        /* SID:2 */
-    [LA_S0] = "Server started", /* SID:17 */
-    [LA_F0] = "Port %d\n",      /* SID:33 */
+    [LA_W1] = "disabled",       /* SID:1 */
+    [LA_W2] = "enabled",        /* SID:2 */
+    [LA_S3] = "Server started", /* SID:3 */
+    [LA_F4] = "Port %d\n",      /* SID:4 */
 };
 ```
 
@@ -238,13 +264,20 @@ SID_NEXT=44
 ### `LANG.zh.h`（--import 生成）
 
 ```c
-static const char* lang_zh[LA_NUM] = {
-    [LA_W0] = "已禁用",          /* SID:1 */
-    [LA_W1] = "已启用",          /* SID:2 */
-    [LA_S0] = "服务器已启动",    /* SID:17 */
-    [LA_S1] = "Server error",   /* SID:18 new */
-    [LA_F0] = "端口 %d\n",      /* [SID:33] UPDATED new: "Port %d open\n" */
+#include ".LANG.h"
+
+/* Embedded zh language table */
+static const char* s_lang_zh[LA_NUM] = {
+    [LA_W1] = "已禁用",          /* SID:1 */
+    [LA_W2] = "已启用",          /* SID:2 */
+    [LA_S3] = "服务器已启动",    /* SID:3 */
+    [LA_S4] = "Server error",   /* SID:4 new */
+    [LA_F5] = "端口 %d\n",      /* [SID:5] UPDATED new: "Port %d open\n" */
 };
+
+static inline int lang_zh(void) {
+    return lang_load(LA_RID, s_lang_zh, LA_NUM);
+}
 ```
 
 ### `lang.en`（--export 翻译模板）

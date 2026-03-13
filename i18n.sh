@@ -207,8 +207,6 @@ if [ ! -f "$USER_LANG_H" ]; then
 #ifndef LANG_H_
 #define LANG_H_
 
-#include <i18n.h>
-
 enum {
     /* 预定义字符串 ID（在此添加项目特定的预定义字符串）*/
     /* 示例：
@@ -231,9 +229,12 @@ enum {
 /* 包含自动生成的语言 ID 定义（必须在 LA_PREDEFINED 之后）*/
 #include ".LANG.h"
 
+#include <i18n.h>
+
 /* 语言初始化函数（自动生成，请勿修改）*/
-static inline void lang_init(void) {
-    lang_def(lang_en, sizeof(lang_en) / sizeof(lang_en[0]), LA_FMT_START);
+static inline int lang_init(void) {
+    LA_RID = lang_def(lang_en, sizeof(lang_en) / sizeof(lang_en[0]), LA_FMT_START);
+    return LA_RID;
 }
 
 #endif /* LANG_H_ */
@@ -837,6 +838,10 @@ cat >> "$OUTPUT_H" <<'EOF'
 /* 字符串表 */
 extern const char* lang_en[LA_NUM];
 
+/* 语言实例 ID（多实例支持） */
+#define LA_RID lang_rid
+extern int lang_rid;
+
 #endif /* LANG_H__ */
 EOF
 
@@ -847,6 +852,8 @@ cat > "$OUTPUT_C" <<EOF
  */
 
 #include ".LANG.h"
+
+int lang_rid;
 
 /* 字符串表 */
 const char* lang_en[LA_NUM] = {
@@ -1061,7 +1068,7 @@ if [ -n "$IMPORT_SUFFIX" ]; then
 #include ".LANG.h"
 
 /* Embedded ${IMPORT_SUFFIX} language table */
-static const char* lang_${IMPORT_SUFFIX}[LA_NUM] = {
+static const char* s_lang_${IMPORT_SUFFIX}[LA_NUM] = {
 EOF
 
     # 三种情况:
@@ -1145,6 +1152,10 @@ EOF
     # 生成尾部
     cat >> "$OUTPUT_IMPORT_H" <<EOF
 };
+
+static inline int lang_${IMPORT_SUFFIX}(void) {
+    return lang_load(LA_RID, s_lang_${IMPORT_SUFFIX}, LA_NUM);
+}
 EOF
     [ "$_new_count" -gt 0 ]     && echo "  NOTE: $_new_count new string(s) added as English placeholders (marked /* new */)"
     [ "$_updated_count" -gt 0 ] && echo "  NOTE: $_updated_count string(s) English changed — old translation kept, marked /* [SID:N] UPDATED new: ... */"

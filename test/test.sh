@@ -172,8 +172,8 @@ inject_cn() {
 import re, sys
 
 # Chinese translation table indexed by SID.
-# Format strings (SID 14-16) use "\\n" (two chars) as the C escape sequence.
-# SID allocation (16 strings): W0-W7 (1-8), S0-S4 (9-13), F0-F2 (14-16)
+# Format strings (SID 14-17) use "\\n" (two chars) as the C escape sequence.
+# SID allocation (17 strings): W1-W8 (1-8), S9-S13 (9-13), F14-F17 (14-17)
 translations = {
     1:  "\u9519\u8bef",           # W_ERROR: 错误
     2:  "\u5931\u8d25",           # W_FAIL:  失败
@@ -186,11 +186,12 @@ translations = {
     9:  "\u5168\u90e8\u6d4b\u8bd5\u901a\u8fc7\u3002",         # S_ALL_PASS: 全部测试通过。
     10: "\u4f60\u597d\uff0c\u4e16\u754c\uff01",               # S_HELLO:    你好，世界！
     11: "\u90e8\u5206\u6d4b\u8bd5\u5931\u8d25\u3002",         # S_SOME_FAIL:部分测试失败。
-    12: "\u6b22\u8fce\u4f7f\u7528\u56fd\u9645\u5316\u3002",   # S_WELCOME:  欢迎使用国际化。
-    13: "UTF-8 String",           # S_UTF8
+    12: "UTF-8 \u5b57\u7b26\u4e32",   # S_UTF8:     UTF-8 字符串
+    13: "\u6b22\u8fce\u4f7f\u7528\u56fd\u9645\u5316\u3002",   # S_WELCOME:  欢迎使用国际化。
     14: "  [%s] %s\\n",           # F_RESULT: keep specifiers (\\n = backslash-n in C)
     15: "\u8bed\u8a00: %s\\n",    # F_LANG:   语言: %s\n
-    16: "\u5df2\u8fd0\u884c: %d\\n",  # F_COUNT: 已运行: %d\n
+    16: "\u5df2\u8fd0\u884c\u6d4b\u8bd5: %d\\n",  # F_COUNT: 已运行测试: %d\n
+    17: "% hello world",          # F_PLAIN:  no change (no format specifiers)
 }
 
 def repl2(m):

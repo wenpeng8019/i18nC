@@ -94,18 +94,34 @@ if (-not (Test-Path $UserLangH)) {
 #ifndef LANG_H_
 #define LANG_H_
 
-#include <i18n.h>
-
 enum {
-    /* 预定义字符串 ID */
+    /* 预定义字符串 ID（在此添加项目特定的预定义字符串）*/
+    /* 示例：
+    SID_CUSTOM0,
+    SID_CUSTOM1,
+    */
+    
     PRED_NUM,
 };
 
+/* 预定义字符串内容（对应上面的枚举）*/
+/* 示例：
+#define STR_CUSTOM0 "Custom String 0"
+#define STR_CUSTOM1 "Custom String 1"
+*/
+
+/* 设置预定义基础 ID（自动生成的 ID 从此值+1 开始）*/
 #define LA_PREDEFINED (PRED_NUM - 1)
+
+/* 包含自动生成的语言 ID 定义（必须在 LA_PREDEFINED 之后）*/
 #include ".LANG.h"
 
-static inline void lang_init(void) {
-    lang_def(lang_en, sizeof(lang_en) / sizeof(lang_en[0]), LA_FMT_START);
+#include <i18n.h>
+
+/* 语言初始化函数（自动生成，请勿修改）*/
+static inline int lang_init(void) {
+    LA_RID = lang_def(lang_en, sizeof(lang_en) / sizeof(lang_en[0]), LA_FMT_START);
+    return LA_RID;
 }
 
 #endif /* LANG_H_ */
@@ -751,6 +767,10 @@ $hLines.Add("")
 $hLines.Add("/* 字符串表 */")
 $hLines.Add("extern const char* lang_en[LA_NUM];")
 $hLines.Add("")
+$hLines.Add("/* 语言实例 ID（多实例支持） */")
+$hLines.Add("#define LA_RID lang_rid")
+$hLines.Add("extern int lang_rid;")
+$hLines.Add("")
 $hLines.Add("#endif /* LANG_H__ */")
 
 [System.IO.File]::WriteAllLines($OutputH, $hLines, [System.Text.UTF8Encoding]::new($false))
@@ -777,11 +797,20 @@ $cLines.Add(" */")
 $cLines.Add("")
 $cLines.Add("#include `".LANG.h`"")
 $cLines.Add("")
+$cLines.Add("int lang_rid;")
+$cLines.Add("")
 $cLines.Add("/* 字符串表 */")
 $cLines.Add("const char* lang_en[LA_NUM] = {")
 
 function Escape-CString([string]$s) {
     return $s.Replace('"', '\"')
+}
+
+# 处理格式字符串：如果不包含 % 则在前面添加 "% " 前缀
+# 这样 print() 会将其当作普通字符串直接输出，而非格式化解析
+function EnsureFmtPrefix([string]$s) {
+    if ($s.Contains('%')) { return $s }
+    return "% $s"
 }
 
 $wid = 0
@@ -805,7 +834,9 @@ foreach ($line in $formatLines) {
     $parts = $line -split '\|', 4; $str = $parts[2]; $key = $parts[1]
     $idName = if ($map.ContainsKey("F|$key")) { $map["F|$key"] } else { "LA_F$fid" }
     $eSid = if ($mapSid.ContainsKey("F|$key")) { $mapSid["F|$key"] } else { 0 }
-    $cLines.Add("    [$idName] = `"$(Escape-CString $str)`",  /* SID:$eSid */")
+    # 如果 LA_F 字符串不包含 % 则添加 "% " 前缀（让 print() 直接输出）
+    $strOut = EnsureFmtPrefix $str
+    $cLines.Add("    [$idName] = `"$(Escape-CString $strOut)`",  /* SID:$eSid */")
     $fid++
 }
 
@@ -824,7 +855,11 @@ if ($ExportMode) {
     $enLines.Add("# Line number corresponds to string ID (starting from 0)")
     foreach ($line in $wordLines)   { $enLines.Add(($line -split '\|', 4)[2]) }
     foreach ($line in $stringLines) { $enLines.Add(($line -split '\|', 4)[2]) }
-    foreach ($line in $formatLines) { $enLines.Add(($line -split '\|', 4)[2]) }
+    # 格式字符串：如果不包含 % 则添加 "% " 前缀
+    foreach ($line in $formatLines) {
+        $strOut = EnsureFmtPrefix ($line -split '\|', 4)[2]
+        $enLines.Add($strOut)
+    }
     [System.IO.File]::WriteAllLines($langEnPath, $enLines, [System.Text.UTF8Encoding]::new($false))
 }
 
@@ -873,7 +908,7 @@ if ($ImportSuffix -ne "") {
     $iLines.Add("#include `".LANG.h`"")
     $iLines.Add("")
     $iLines.Add("/* Embedded $ImportSuffix language table */")
-    $iLines.Add("static const char* lang_${ImportSuffix}[LA_NUM] = {")
+    $iLines.Add("static const char* s_lang_${ImportSuffix}[LA_NUM] = {")
 
     $newCount = 0; $updatedCount = 0
 
@@ -908,7 +943,9 @@ if ($ImportSuffix -ne "") {
     }
     foreach ($line in $formatLines) {
         $parts = $line -split '\|', 4
-        Add-ImportEntry -Type "F" -Key $parts[1] -Escaped (Escape-CString $parts[2])
+        # 如果 LA_F 字符串不包含 % 则添加 "% " 前缀
+        $strOut = EnsureFmtPrefix $parts[2]
+        Add-ImportEntry -Type "F" -Key $parts[1] -Escaped (Escape-CString $strOut)
     }
 
     # 失效的 SID：保留旧翻译，ID 改为 _LA_{SID}
@@ -924,6 +961,10 @@ if ($ImportSuffix -ne "") {
     }
 
     $iLines.Add("};")
+    $iLines.Add("")
+    $iLines.Add("static inline int lang_${ImportSuffix}(void) {")
+    $iLines.Add("    return lang_load(LA_RID, s_lang_${ImportSuffix}, LA_NUM);")
+    $iLines.Add("}")
     [System.IO.File]::WriteAllLines($importH, $iLines, [System.Text.UTF8Encoding]::new($false))
     if ($newCount -gt 0)     { Write-Host "  NOTE: $newCount new string(s) added as English placeholders (marked /* new */)" }
     if ($updatedCount -gt 0) { Write-Host "  NOTE: $updatedCount string(s) English changed — old translation kept, marked /* [SID:N] UPDATED new: ... */" }
