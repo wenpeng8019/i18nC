@@ -209,7 +209,7 @@ if [ ! -f "$USER_LANG_H" ]; then
 
 #include <i18n.h>
 
-typedef enum {
+enum {
     /* 预定义字符串 ID（在此添加项目特定的预定义字符串）*/
     /* 示例：
     SID_CUSTOM0,
@@ -282,7 +282,8 @@ _fmt_ensure_prefix() {
 cleanup() {
     if [ "$DEBUG_MODE" -eq 0 ]; then
         rm -f "$TEMP_ALL" "$TEMP_WORDS" "$TEMP_FORMATS" "$TEMP_STRINGS" "$TEMP_MAP" \
-              "$TEMP_OLD_SID_MAP" "$TEMP_OLD_IMPORT_MAP" "$TEMP_ENUM_DATA"
+              "$TEMP_OLD_SID_MAP" "$TEMP_OLD_IMPORT_MAP" "$TEMP_ENUM_DATA" \
+              "${TEMP_EN_TRANS_MAP:-}"
     fi
 }
 trap cleanup EXIT
@@ -440,6 +441,15 @@ cat > "$_marker_h" <<'MARKER_EOF'
 #endif
 #ifndef LA_F
 #define LA_F(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NF_END_
+#endif
+#ifndef LA_CW
+#define LA_CW(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NW_END_
+#endif
+#ifndef LA_CS
+#define LA_CS(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NS_END_
+#endif
+#ifndef LA_CF
+#define LA_CF(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NF_END_
 #endif
 MARKER_EOF
 
@@ -1002,10 +1012,13 @@ if [ -n "$IMPORT_SUFFIX" ]; then
 
     # 解析旧 import 文件：建立 SID → 旧译文 映射
     # 格式：    [LA_Xx] = "译文",  /* SID:N */  或  /* UPDATED [SID:N] ... */
+    #           [_LA_N] = "译文",  /* SID:N invalid */  （失效条目）
     : > "$TEMP_OLD_IMPORT_MAP"
+    TEMP_EN_TRANS_MAP=$(mktemp)  # 额外：英文 → 翻译 映射
+    : > "$TEMP_EN_TRANS_MAP"
     if [ -f "$OUTPUT_IMPORT_H" ]; then
         awk '
-        /\[LA_[WSF][0-9]+\]/ {
+        /\[_?LA_[WSF]?[0-9]+\]/ {
             line = $0
             # 提取 SID
             entry_sid = ""
@@ -1031,6 +1044,12 @@ if [ -n "$IMPORT_SUFFIX" ]; then
             print entry_sid "|" result
         }
         ' "$OUTPUT_IMPORT_H" > "$TEMP_OLD_IMPORT_MAP" 2>/dev/null || true
+        # 构建 英文→翻译 映射（结合 TEMP_OLD_SID_MAP 和 TEMP_OLD_IMPORT_MAP）
+        # 无论英文和翻译是否相同都保留（用于 SID 变更时的内容匹配）
+        awk -F'|' '
+        NR==FNR { sid_en[$1]=$2; next }  # 第一文件: SID→英文
+        { sid=$1; trans=$2; en=sid_en[sid]; if(en!="") print en"|"trans }
+        ' "$TEMP_OLD_SID_MAP" "$TEMP_OLD_IMPORT_MAP" > "$TEMP_EN_TRANS_MAP" 2>/dev/null || true
     fi
 
     # 生成头文件头部
@@ -1058,6 +1077,10 @@ EOF
         _entry_sid=$(_I18N_KEY="$_key" awk -F'|' -v t="$_type" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $4; exit}' "$TEMP_MAP")
         _old_translation=$(awk -F'|' -v s="${_entry_sid:-0}" '$1==s {print $2; exit}' "$TEMP_OLD_IMPORT_MAP")
         _old_english=$(awk -F'|' -v s="${_entry_sid:-0}" '$1==s {print $2; exit}' "$TEMP_OLD_SID_MAP")
+        # 如果按 SID 找不到旧翻译，尝试按英文内容查找（处理 ID 变更情况）
+        if [ -z "${_old_translation:-}" ]; then
+            _old_translation=$(_I18N_ESC="$_escaped" awk -F'|' 'BEGIN{e=ENVIRON["_I18N_ESC"]} $1==e {print $2; exit}' "$TEMP_EN_TRANS_MAP")
+        fi
         if [ -z "${_old_translation:-}" ]; then
             # 新增条目
             printf '    [%s] = "%s",  /* SID:%s new */\n' \
@@ -1101,12 +1124,31 @@ EOF
         done < "$TEMP_FORMATS"
     fi
 
+    # 失效的 SID：保留旧翻译，ID 改为 _LA_{SID}
+    _invalid_count=0
+    if [ -s "$TEMP_OLD_IMPORT_MAP" ]; then
+        # 收集当前有效的 SID 集合
+        awk -F'|' '{print $4}' "$TEMP_MAP" | sort -u > "$TEMP_OLD_IMPORT_MAP.valid"
+        # 遍历旧翻译，找出失效的 SID
+        while IFS='|' read -r old_sid old_trans; do
+            # 检查该 SID 是否仍有效
+            if ! grep -q "^${old_sid}$" "$TEMP_OLD_IMPORT_MAP.valid" 2>/dev/null; then
+                # 失效：输出 [_LA_{SID}] = "旧翻译"
+                printf '    [_LA_%s] = "%s",  /* SID:%s invalid */\n' \
+                    "$old_sid" "$old_trans" "$old_sid" >> "$OUTPUT_IMPORT_H"
+                _invalid_count=$((_invalid_count + 1))
+            fi
+        done < "$TEMP_OLD_IMPORT_MAP"
+        rm -f "$TEMP_OLD_IMPORT_MAP.valid"
+    fi
+
     # 生成尾部
     cat >> "$OUTPUT_IMPORT_H" <<EOF
 };
 EOF
     [ "$_new_count" -gt 0 ]     && echo "  NOTE: $_new_count new string(s) added as English placeholders (marked /* new */)"
     [ "$_updated_count" -gt 0 ] && echo "  NOTE: $_updated_count string(s) English changed — old translation kept, marked /* [SID:N] UPDATED new: ... */"
+    [ "$_invalid_count" -gt 0 ] && echo "  NOTE: $_invalid_count invalidated string(s) kept with _LA_{SID} placeholder"
 fi
 
 echo "Generated:"
@@ -1144,8 +1186,17 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
             while (i <= L) {
                 if (substr(line,i,3) == "LA_") {
                     t = substr(line,i+3,1)
+                    skip = 4  # 正常情况跳过 "LA_X"
+                    # 处理 LA_CW, LA_CS, LA_CF 别名
+                    if (t == "C") {
+                        t2 = substr(line,i+4,1)
+                        if (t2 == "W" || t2 == "S" || t2 == "F") {
+                            t = t2
+                            skip = 5  # 跳过 "LA_CX"
+                        }
+                    }
                     if (t == "W" || t == "S" || t == "F") {
-                        j = i+4
+                        j = i+skip
                         while (j <= L && substr(line,j,1) ~ /[ \t]/) j++
                         if (j <= L && substr(line,j,1) == "(") {
                             j++

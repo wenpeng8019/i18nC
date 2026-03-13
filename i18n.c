@@ -24,6 +24,12 @@ static char* extract_format_specs(const char* str) {
     const char* p = str;
     
     specs[0] = '\0';
+    
+    /* 跳过 stdc print() 的 "% " 前缀（表示无格式参数的字符串） */
+    if (p[0] == '%' && p[1] == ' ') {
+        p += 2;
+    }
+    
     while (*p && pos < 255) {
         if (*p == '%') {
             p++;

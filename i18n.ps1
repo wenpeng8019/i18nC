@@ -96,7 +96,7 @@ if (-not (Test-Path $UserLangH)) {
 
 #include <i18n.h>
 
-typedef enum {
+enum {
     /* 预定义字符串 ID */
     PRED_NUM,
 };
@@ -319,6 +319,15 @@ $markerContent = @'
 #endif
 #ifndef LA_F
 #define LA_F(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NF_END_
+#endif
+#ifndef LA_CW
+#define LA_CW(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NW_END_
+#endif
+#ifndef LA_CS
+#define LA_CS(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NS_END_
+#endif
+#ifndef LA_CF
+#define LA_CF(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NF_END_
 #endif
 '@
 [System.IO.File]::WriteAllText($TempMarkerH, $markerContent, [System.Text.UTF8Encoding]::new($false))
@@ -754,7 +763,7 @@ $hLines.Add("#endif /* LANG_H__ */")
 $oldSidMap = @{}   # SID → en_string
 if (Test-Path $OutputC) {
     Get-Content $OutputC | ForEach-Object {
-        if ($_ -match '\[LA_[WSF]\d+\]\s*=\s*"((?:[^"\\]|\\.)*)",\s*/\*\s*SID:(\d+)') {
+        if ($_ -match '\[_?LA_[WSF]?\d+\]\s*=\s*"((?:[^"\\]|\\.)*)",\s*/\*\s*SID:(\d+)') {
             $val = $Matches[1]; $s2 = [int]$Matches[2]
             if ($s2 -gt 0 -and -not $oldSidMap.ContainsKey($s2)) { $oldSidMap[$s2] = $val }
         }
@@ -834,13 +843,25 @@ if ($ImportSuffix -ne "") {
     }
 
     # 解析旧 import 文件：建立 SID → 旧译文 映射
+    # 支持 [LA_Xx] 和 [_LA_N] 格式
     $oldImportMap = @{}   # SID → old_translation
     if (Test-Path $importH) {
         Get-Content $importH | ForEach-Object {
-            if ($_ -match '\[LA_[WSF]\d+\]\s*=\s*"((?:[^"\\]|\\.)*)",.*SID:(\d+)') {
+            if ($_ -match '\[_?LA_[WSF]?\d+\]\s*=\s*"((?:[^"\\]|\\.)*)",.*SID:(\d+)') {
                 $val = $Matches[1]; $s2 = [int]$Matches[2]
                 if ($s2 -gt 0 -and -not $oldImportMap.ContainsKey($s2)) { $oldImportMap[$s2] = $val }
             }
+        }
+    }
+
+    # 构建 英文→翻译 映射（用于 SID 变更时的内容匹配回退）
+    $enTransMap = @{}   # en_string → translation
+    foreach ($kv in $oldImportMap.GetEnumerator()) {
+        $sid = $kv.Key
+        $trans = $kv.Value
+        if ($oldSidMap.ContainsKey($sid)) {
+            $en = $oldSidMap[$sid]
+            if (-not $enTransMap.ContainsKey($en)) { $enTransMap[$en] = $trans }
         }
     }
 
@@ -860,8 +881,12 @@ if ($ImportSuffix -ne "") {
         param([string]$Type, [string]$Key, [string]$Escaped)
         $idName   = if ($map.ContainsKey("${Type}|${Key}"))    { $map["${Type}|${Key}"]    } else { "0" }
         $eSid     = if ($mapSid.ContainsKey("${Type}|${Key}")) { $mapSid["${Type}|${Key}"] } else { 0 }
-        $oldTrans = if ($oldImportMap.ContainsKey($eSid))          { $oldImportMap[$eSid]          } else { $null }
-        $oldEn    = if ($oldSidMap.ContainsKey($eSid))             { $oldSidMap[$eSid]             } else { $null }
+        $oldTrans = if ($oldImportMap.ContainsKey($eSid))      { $oldImportMap[$eSid]      } else { $null }
+        $oldEn    = if ($oldSidMap.ContainsKey($eSid))         { $oldSidMap[$eSid]         } else { $null }
+        # 如果按 SID 找不到旧翻译，尝试按英文内容查找（处理 ID 变更情况）
+        if ($null -eq $oldTrans -and $enTransMap.ContainsKey($Escaped)) {
+            $oldTrans = $enTransMap[$Escaped]
+        }
         if ($null -eq $oldTrans) {
             $iLines.Add("    [$idName] = `"$Escaped`",  /* SID:$eSid new */")
             $script:newCount++
@@ -886,10 +911,23 @@ if ($ImportSuffix -ne "") {
         Add-ImportEntry -Type "F" -Key $parts[1] -Escaped (Escape-CString $parts[2])
     }
 
+    # 失效的 SID：保留旧翻译，ID 改为 _LA_{SID}
+    $validSids = @{}
+    $mapSid.Values | ForEach-Object { $validSids[$_] = $true }
+    $invalidCount = 0
+    foreach ($kv in $oldImportMap.GetEnumerator()) {
+        $oldSid = $kv.Key
+        if (-not $validSids.ContainsKey($oldSid)) {
+            $iLines.Add("    [_LA_$oldSid] = `"$($kv.Value)`",  /* SID:$oldSid invalid */")
+            $invalidCount++
+        }
+    }
+
     $iLines.Add("};")
     [System.IO.File]::WriteAllLines($importH, $iLines, [System.Text.UTF8Encoding]::new($false))
     if ($newCount -gt 0)     { Write-Host "  NOTE: $newCount new string(s) added as English placeholders (marked /* new */)" }
     if ($updatedCount -gt 0) { Write-Host "  NOTE: $updatedCount string(s) English changed — old translation kept, marked /* [SID:N] UPDATED new: ... */" }
+    if ($invalidCount -gt 0) { Write-Host "  NOTE: $invalidCount invalidated string(s) kept with _LA_{SID} placeholder" }
 }
 
 # ============================================================================
@@ -918,11 +956,12 @@ Write-Host "Updating source files..."
 
 # 正则替换 MatchEvaluator（PS 5.1+ 支持 ScriptBlock 作为 MatchEvaluator）
 # 可选消耗已有的数字第三参数（SID），避免重复追加
-$reW = [regex]'(LA_W\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
-$reS = [regex]'(LA_S\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
-$reF = [regex]'(LA_F\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
+# 支持 LA_W/LA_CW, LA_S/LA_CS, LA_F/LA_CF 别名
+$reW = [regex]'(LA_C?W\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
+$reS = [regex]'(LA_C?S\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
+$reF = [regex]'(LA_C?F\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
 # 多段字符串字面量（如 PRIu64 宏拼接）：强制 ID/SID 为 0, 0
-$reMultiSeg = [regex]'(LA_[WSF]\s*\(\s*(?:u8|[uLU])?"(?:[^"\\]|\\.)*"\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*"(?:[^"\\]|\\.)*"\s*)+,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
+$reMultiSeg = [regex]'(LA_C?[WSF]\s*\(\s*(?:u8|[uLU])?"(?:[^"\\]|\\.)*"\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*"(?:[^"\\]|\\.)*"\s*)+,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
 
 # 闭包引用 $map 和 $mapSid
 $mapRef    = $map
