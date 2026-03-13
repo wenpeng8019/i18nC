@@ -46,7 +46,7 @@ rm -f LANG.h
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== [Stage 1] First-time gen ==="
-(cd "$I18N_DIR" && bash i18n.sh test)
+(cd "$I18N_DIR" && bash i18n.sh test --name hello)
 
 check_file ".LANG.h generated"   ".LANG.h"
 check_file ".LANG.c generated"   ".LANG.c"
@@ -88,7 +88,7 @@ check "hello-i18n exits 0"     ./hello-i18n
 echo ""
 echo "=== [Stage 3] Idempotency (re-run gen) ==="
 NEXT_BEFORE=$(grep SID_NEXT .i18n | head -1)
-(cd "$I18N_DIR" && bash i18n.sh test) > /tmp/i18n_gen2.log 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --name hello) > /tmp/i18n_gen2.log 2>&1
 NEXT_AFTER=$(grep SID_NEXT .i18n | head -1)
 if [ "$NEXT_BEFORE" = "$NEXT_AFTER" ]; then
     ok "SID_NEXT unchanged after re-run"
@@ -110,7 +110,7 @@ echo "=== [Stage 3b] --ndebug mode (compact sequential IDs) ==="
 cp .LANG.h .LANG.h.debug
 cp .LANG.c .LANG.c.debug
 
-(cd "$I18N_DIR" && bash i18n.sh test --ndebug) > /tmp/i18n_ndebug.log 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --ndebug) > /tmp/i18n_ndebug.log 2>&1
 
 check_file ".LANG.h exists after --ndebug"   ".LANG.h"
 check_file ".LANG.c exists after --ndebug"   ".LANG.c"
@@ -149,7 +149,7 @@ echo "  Restored debug-mode .LANG.h/.LANG.c"
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== [Stage 4] First --import cn (all new) ==="
-(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /tmp/i18n_import1.log 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /tmp/i18n_import1.log 2>&1
 
 check_file "LANG.cn.h created"           "LANG.cn.h"
 # 应报告 17 条新字符串（8W + 5S + 4F）
@@ -233,7 +233,7 @@ check "hello-cn exits 0"   ./hello-cn
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== [Stage 6] Second --import cn (unchanged, no NOTE) ==="
-(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /tmp/i18n_import2.log 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /tmp/i18n_import2.log 2>&1
 check_not_found "no NOTE in second import"        "NOTE:.*new"     /tmp/i18n_import2.log
 check_not_found "no UPDATED in second import"     "UPDATED"        /tmp/i18n_import2.log
 # 翻译保持不变（中文仍在）
@@ -275,7 +275,7 @@ check_contains  "Chinese preserved after re-import" "你好" LANG.cn.h
 #     5. Run --import cn               (detects old="Hello, World!" vs new="Hello, World!!")
 #     ... But that's too invasive.
 #
-#   SIMPLEST correct approach: run "bash i18n.sh test --import cn" which
+#   SIMPLEST correct approach: run "bash i18n.sh test --name hello --import cn" which
 #   internally does gen + import in one pass. In that case:
 #     - TEMP_OLD_SID_MAP is built from .LANG.c BEFORE this run overwrites it
 #     - Then gen extracts "Hello, World!!" from source
@@ -290,7 +290,7 @@ sed -i.tmp 's/LA_S("Hello, World!",/LA_S("Hello, World!!",/' hello.c
 rm -f hello.c.tmp
 
 # Run gen+import in a single call (i18n.sh does gen internally, then import)
-(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /tmp/i18n_import3.log 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /tmp/i18n_import3.log 2>&1
 
 check_contains "UPDATED in LANG.cn.h"            "UPDATED"           LANG.cn.h
 check_contains "UPDATED shows new eng"            "Hello, World!!"    LANG.cn.h
@@ -308,10 +308,10 @@ mv hello.c.bak hello.c
 # Single combined gen+import run -- UPDATED entry will appear for SID 7 again
 # since we reverted "Hello, World!!" back to "Hello, World!" but the .LANG.c
 # saved "Hello, World!!" as the baseline. Run gen+import twice to settle.
-(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /dev/null 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /dev/null 2>&1
 # Update translations (UPDATED entry may have NULL -- inject again)
 inject_cn
-(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /tmp/i18n_settle.log 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /tmp/i18n_settle.log 2>&1
 check_not_found "UPDATED gone after restore+settle" "UPDATED" LANG.cn.h
 check_contains  "Chinese restored after settle"     $(printf '\xe4\xbd\xa0\xe5\xa5\xbd') LANG.cn.h
 check_not_found "no NOTE after settle" "NOTE:.*new" /tmp/i18n_settle.log
@@ -335,7 +335,7 @@ rm -f hello.c.tmp
 SID_NEXT_BEFORE=$(grep SID_NEXT .i18n | head -1)
 
 # Run gen+import
-(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /tmp/i18n_delete.log 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /tmp/i18n_delete.log 2>&1
 
 SID_NEXT_AFTER=$(grep SID_NEXT .i18n | head -1)
 
@@ -350,7 +350,7 @@ grep "SID:5" LANG.cn.h || echo "    (none found)"
 
 # Restore
 mv hello.c.stage9.bak hello.c
-(cd "$I18N_DIR" && bash i18n.sh test --import cn) > /dev/null 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /dev/null 2>&1
 inject_cn  # Restore Chinese translations
 
 # ---------------------------------------------------------------------------
@@ -367,8 +367,8 @@ cp .LANG.c .LANG.c.debug
 cp LANG.cn.h LANG.cn.h.debug
 
 # Gen with --ndebug and import cn in separate steps
-(cd "$I18N_DIR" && bash i18n.sh test --ndebug) > /dev/null 2>&1
-(cd "$I18N_DIR" && bash i18n.sh test --ndebug --import cn) > /tmp/i18n_ndebug_cn.log 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --ndebug) > /dev/null 2>&1
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --ndebug --import cn) > /tmp/i18n_ndebug_cn.log 2>&1
 
 check_file  "LANG.cn.h exists after ndebug import"  "LANG.cn.h"
 check_not_found "no _LA_ gap in ndebug .LANG.h"     "_LA_[0-9]" .LANG.h

@@ -240,7 +240,7 @@ int main(void)
 {
     /* Initialize i18n runtime before any string is used */
 #ifdef I18N_ENABLED
-    lang_init();    /* register lang_en[] as the default English table */
+    LA_init();    /* register lang_en[] as the default English table */
 #endif
 
     /* Demo greeting */

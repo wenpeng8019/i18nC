@@ -52,7 +52,7 @@ set(LANG_C   "${CMAKE_CURRENT_SOURCE_DIR}/.LANG.c")
 # --------------------------------------------------------------------------
 add_custom_command(
     OUTPUT  "${LANG_H}" "${LANG_C}"
-    COMMAND bash "${I18N_DIR}/i18n.sh" test
+    COMMAND bash "${I18N_DIR}/i18n.sh" test --name hello
     WORKING_DIRECTORY "${I18N_DIR}"
     COMMENT "i18n: generating .LANG.h, .LANG.c, LANG.h (debug mode)"
     VERBATIM
@@ -68,7 +68,7 @@ add_custom_target(gen
 #   cmake --build <builddir> -t gen-ndebug
 # --------------------------------------------------------------------------
 add_custom_target(gen-ndebug
-    COMMAND bash "${I18N_DIR}/i18n.sh" test --ndebug
+    COMMAND bash "${I18N_DIR}/i18n.sh" test --name hello --ndebug
     WORKING_DIRECTORY "${I18N_DIR}"
     COMMENT "i18n: generating .LANG.h, .LANG.c, LANG.h (ndebug/release mode)"
     VERBATIM
@@ -79,7 +79,7 @@ add_custom_target(gen-ndebug
 #   cmake --build <builddir> -t import-cn
 # --------------------------------------------------------------------------
 add_custom_target(import-cn
-    COMMAND bash "${I18N_DIR}/i18n.sh" test --import cn
+    COMMAND bash "${I18N_DIR}/i18n.sh" test --name hello --import cn
     WORKING_DIRECTORY "${I18N_DIR}"
     COMMENT "i18n: refreshing LANG.cn.h"
     VERBATIM

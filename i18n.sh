@@ -131,9 +131,10 @@
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <source_dir> [--ndebug] [--export] [--import SUFFIX]"
+    echo "Usage: $0 <source_dir> [--name NAME] [--ndebug] [--export] [--import SUFFIX]"
     echo "Example: $0 p2p_ping"
     echo "Options:"
+    echo "  --name NAME       Set module name for unique symbols (default: auto from dir name)"
     echo "  --export          Export lang.en template file for translations"
     echo "  --import SUFFIX   Generate LANG.SUFFIX.h with embedded language table from lang.SUFFIX"
     echo "  --ndebug          Generate compact sequential IDs (release mode)"
@@ -146,6 +147,7 @@ EXPORT_LANG_EN=0
 IMPORT_SUFFIX=""
 NDEBUG_MODE=0
 DEBUG_MODE=0
+LA_NAME=""
 
 # 解析选项
 shift
@@ -161,6 +163,14 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             IMPORT_SUFFIX="$1"
+            ;;
+        --name)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: --name requires a NAME argument"
+                exit 1
+            fi
+            LA_NAME="$1"
             ;;
         --ndebug)
             NDEBUG_MODE=1
@@ -188,12 +198,21 @@ SID_NEXT=""
 I18N_REINIT=0
 if [ -f "$I18N_FILE" ]; then
     SID_NEXT=$(awk -F= '/^SID_NEXT=/{print $2}' "$I18N_FILE" | tr -d '[:space:]')
+    # 如果没有通过 --name 指定，尝试从 .i18n 文件读取
+    if [ -z "$LA_NAME" ]; then
+        LA_NAME=$(awk -F= '/^LA_NAME=/{print $2}' "$I18N_FILE" | tr -d '[:space:]')
+    fi
 else
     I18N_REINIT=1
     echo "Note: $I18N_FILE not found — reinitializing all SIDs from 1"
 fi
 [ -z "${SID_NEXT:-}" ] && SID_NEXT=1
 SID_NEXT_START=$SID_NEXT
+
+# 如果 LA_NAME 仍未设置，从目录名自动生成
+if [ -z "$LA_NAME" ]; then
+    LA_NAME=$(basename "$SOURCE_DIR")
+fi
 
 if [ ! -d "$SOURCE_DIR" ]; then
     echo "Error: Directory not found: $SOURCE_DIR"
@@ -229,13 +248,19 @@ enum {
 /* 包含自动生成的语言 ID 定义（必须在 LA_PREDEFINED 之后）*/
 #include ".LANG.h"
 
-#define LA_RID lang_rid
-extern int lang_rid;
-
+EOF
+    # 动态生成 LA_RID 宏和 extern 声明（使用模块名避免符号冲突）
+    printf '#define LA_RID LA_%s\n' "$LA_NAME" >> "$USER_LANG_H"
+    printf 'extern int LA_%s;\n\n' "$LA_NAME" >> "$USER_LANG_H"
+    cat >> "$USER_LANG_H" <<'EOF'
 #include <i18n.h>
 
-/* 语言初始化函数（自动生成，请勿修改）*/
-void lang_init(void);
+EOF
+    # 动态生成 lang_init 函数声明（使用模块名避免符号冲突）
+    printf '/* 语言初始化函数（自动生成，请勿修改）*/\n' >> "$USER_LANG_H"
+    printf 'void LA_%s_init(void);\n' "$LA_NAME" >> "$USER_LANG_H"
+    printf '#define LA_init LA_%s_init\n' "$LA_NAME" >> "$USER_LANG_H"
+    cat >> "$USER_LANG_H" <<'EOF'
 
 #endif /* LANG_H_ */
 EOF
@@ -846,7 +871,7 @@ cat > "$OUTPUT_C" <<EOF
 
 #include "LANG.h"
 
-int lang_rid;
+int LA_${LA_NAME};
 
 /* 字符串表 */
 static const char* s_lang_en[LA_NUM] = {
@@ -916,11 +941,11 @@ if [ "$format_count" -gt 0 ]; then
     done < "$TEMP_FORMATS"
 fi
 
-cat >> "$OUTPUT_C" <<'EOF'
+cat >> "$OUTPUT_C" <<EOF
 };
 
 /* 语言初始化函数（自动生成，请勿修改）*/
-void lang_init(void) {
+void LA_${LA_NAME}_init(void) {
     LA_RID = lang_def(s_lang_en, sizeof(s_lang_en) / sizeof(s_lang_en[0]), LA_FMT_START);
 }
 EOF
@@ -1313,14 +1338,17 @@ echo
 echo "Done! Source files updated with correct LA_W/F/Sxxx IDs"
 echo "Next: Rebuild with updated LANG.c"
 
-# 保存 SID_NEXT 到 .i18n 文件（始终写入）
+# 保存 SID_NEXT 和 LA_NAME 到 .i18n 文件（始终写入）
 # reinit 时不做 max 提升，正常模式下推至已提取的最大 SID+1 防止冲突
 if [ "$I18N_REINIT" -eq 0 ] && [ "$max_sid" -ge "$SID_NEXT" ] 2>/dev/null; then
     SID_NEXT=$((max_sid + 1))
 fi
-printf 'SID_NEXT=%d\n' "$SID_NEXT" > "$I18N_FILE"
+{
+    printf 'SID_NEXT=%d\n' "$SID_NEXT"
+    printf 'LA_NAME=%s\n' "$LA_NAME"
+} > "$I18N_FILE"
 if [ "$SID_NEXT" -gt "$SID_NEXT_START" ]; then
-    echo "Updated $I18N_FILE: SID_NEXT=$SID_NEXT (allocated $((SID_NEXT - SID_NEXT_START)) new IDs)"
+    echo "Updated $I18N_FILE: SID_NEXT=$SID_NEXT, LA_NAME=$LA_NAME (allocated $((SID_NEXT - SID_NEXT_START)) new IDs)"
 else
-    echo "Updated $I18N_FILE: SID_NEXT=$SID_NEXT (no new IDs allocated)"
+    echo "Updated $I18N_FILE: SID_NEXT=$SID_NEXT, LA_NAME=$LA_NAME (no new IDs allocated)"
 fi

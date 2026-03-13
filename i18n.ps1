@@ -26,6 +26,7 @@ $ExportMode   = $false
 $ImportSuffix = ""
 $NdebugMode   = $false
 $DebugMode    = $false
+$LaName       = ""
 
 $i = 0
 while ($i -lt $args.Count) {
@@ -33,6 +34,7 @@ while ($i -lt $args.Count) {
     switch ($a) {
         "--export"  { $ExportMode = $true }
         "--import"  { $i++; $ImportSuffix = $args[$i] }
+        "--name"    { $i++; $LaName = $args[$i] }
         "--ndebug"  { $NdebugMode = $true }
         "--debug"   { $DebugMode = $true }
         default {
@@ -44,9 +46,10 @@ while ($i -lt $args.Count) {
 }
 
 if ($SourceDir -eq "") {
-    Write-Host "Usage: i18n.ps1 <source_dir> [--ndebug] [--export] [--import SUFFIX] [--debug]"
+    Write-Host "Usage: i18n.ps1 <source_dir> [--name NAME] [--ndebug] [--export] [--import SUFFIX] [--debug]"
     Write-Host "Example: i18n.ps1 p2p_ping"
     Write-Host "Options:"
+    Write-Host "  --name NAME       Set module name for unique symbols (default: auto from dir name)"
     Write-Host "  --ndebug          Generate compact sequential IDs (release mode)"
     Write-Host "  --export          Export lang.en template file for translations"
     Write-Host "  --import SUFFIX   Generate LANG.SUFFIX.h with embedded language table"
@@ -73,11 +76,18 @@ $I18NReinit = $false
 if (Test-Path $I18NFile) {
     $i18nContent = Get-Content $I18NFile -Raw -ErrorAction SilentlyContinue
     if ($i18nContent -match '(?m)^SID_NEXT=(\d+)') { $SidNext = [int]$Matches[1] }
+    # 如果没有通过 --name 指定，尝试从 .i18n 文件读取
+    if ($LaName -eq "" -and $i18nContent -match '(?m)^LA_NAME=(\w+)') { $LaName = $Matches[1] }
 } else {
     $I18NReinit = $true
     Write-Host "Note: $I18NFile not found — reinitializing all SIDs from 1"
 }
 $SidNextStart = $SidNext
+
+# 如果 LA_NAME 仍未设置，从目录名自动生成
+if ($LaName -eq "") {
+    $LaName = Split-Path -Leaf $SourceDir
+}
 
 if (-not (Test-Path $SourceDir -PathType Container)) {
     Write-Error "Error: Directory not found: $SourceDir"
@@ -90,7 +100,7 @@ if (-not (Test-Path $SourceDir -PathType Container)) {
 
 if (-not (Test-Path $UserLangH)) {
     Write-Host "Creating template LANG.h in $SourceDir..."
-    $template = @'
+    $template = @"
 #ifndef LANG_H_
 #define LANG_H_
 
@@ -116,16 +126,17 @@ enum {
 /* 包含自动生成的语言 ID 定义（必须在 LA_PREDEFINED 之后）*/
 #include ".LANG.h"
 
-#define LA_RID lang_rid
-extern int lang_rid;
+#define LA_RID LA_${LaName}
+extern int LA_${LaName};
 
 #include <i18n.h>
 
 /* 语言初始化函数（自动生成，请勿修改）*/
-void lang_init(void);
+void LA_${LaName}_init(void);
+#define LA_init LA_${LaName}_init
 
 #endif /* LANG_H_ */
-'@
+"@
     [System.IO.File]::WriteAllText($UserLangH, $template, [System.Text.UTF8Encoding]::new($false))
     Write-Host "  Created: $UserLangH"
 }
@@ -790,7 +801,7 @@ $cLines.Add(" */")
 $cLines.Add("")
 $cLines.Add("#include `"LANG.h`"")
 $cLines.Add("")
-$cLines.Add("int lang_rid;")
+$cLines.Add("int LA_${LaName};")
 $cLines.Add("")
 $cLines.Add("/* 字符串表 */")
 $cLines.Add("static const char* s_lang_en[LA_NUM] = {")
@@ -836,7 +847,7 @@ foreach ($line in $formatLines) {
 $cLines.Add("};")
 $cLines.Add("")
 $cLines.Add("/* 语言初始化函数（自动生成，请勿修改）*/")
-$cLines.Add("void lang_init(void) {")
+$cLines.Add("void LA_${LaName}_init(void) {")
 $cLines.Add("    LA_RID = lang_def(s_lang_en, sizeof(s_lang_en) / sizeof(s_lang_en[0]), LA_FMT_START);")
 $cLines.Add("}")
 [System.IO.File]::WriteAllLines($OutputC, $cLines, [System.Text.UTF8Encoding]::new($false))
@@ -1054,16 +1065,17 @@ Write-Host ""
 Write-Host "Done! Source files updated with correct LA_W/F/Sxxx IDs"
 Write-Host "Next: Rebuild with updated LANG.c"
 
-# 保存 SID_NEXT 到 .i18n 文件（始终写入）
+# 保存 SID_NEXT 和 LA_NAME 到 .i18n 文件（始终写入）
 # reinit 时不做 max 提升；正常模式下推至已提取的最大 SID+1 防止冲突
 if (-not $I18NReinit -and $maxSid -ge $SidNext) {
     $SidNext = $maxSid + 1
 }
-[System.IO.File]::WriteAllText($I18NFile, "SID_NEXT=$SidNext`n", [System.Text.UTF8Encoding]::new($false))
+$i18nContent = "SID_NEXT=$SidNext`nLA_NAME=$LaName`n"
+[System.IO.File]::WriteAllText($I18NFile, $i18nContent, [System.Text.UTF8Encoding]::new($false))
 if ($SidNext -gt $SidNextStart) {
-    Write-Host "Updated $I18NFile`: SID_NEXT=$SidNext (allocated $($SidNext - $SidNextStart) new IDs)"
+    Write-Host "Updated $I18NFile`: SID_NEXT=$SidNext, LA_NAME=$LaName (allocated $($SidNext - $SidNextStart) new IDs)"
 } else {
-    Write-Host "Updated $I18NFile`: SID_NEXT=$SidNext (no new IDs allocated)"
+    Write-Host "Updated $I18NFile`: SID_NEXT=$SidNext, LA_NAME=$LaName (no new IDs allocated)"
 }
 
 # 清理临时文件
