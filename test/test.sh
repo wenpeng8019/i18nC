@@ -317,15 +317,16 @@ check_contains  "Chinese restored after settle"     $(printf '\xe4\xbd\xa0\xe5\x
 check_not_found "no NOTE after settle" "NOTE:.*new" /tmp/i18n_settle.log
 
 # ---------------------------------------------------------------------------
-# Stage 9 -- String deletion (orphan SID)
+# Stage 9 -- String deletion → disabled (trickle mode)
 #   Remove one string definition from source; verify:
-#     - SID_NEXT stays at 17 (no SID reclamation)
-#     - .LANG.h/.LANG.c no longer contain the deleted string
-#     - LANG.cn.h preserves the orphan SID's translation (stale entry)
+#     - SID_NEXT stays at 18 (no SID reclamation)
+#     - .LANG.h retains LA_W5 with "disabled" prefix in comment
+#     - .LANG.c retains the string with "disabled" comment
+#     - LANG.cn.h preserves the entry (disabled, real ID)
 #     - Other SIDs remain unchanged
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== [Stage 9] String deletion (orphan SID) ==="
+echo "=== [Stage 9] String deletion → disabled (trickle mode) ==="
 cp hello.c hello.c.stage9.bak
 
 # Delete W_READY (originally SID 5)
@@ -340,13 +341,15 @@ SID_NEXT_BEFORE=$(grep SID_NEXT .i18n | head -1)
 SID_NEXT_AFTER=$(grep SID_NEXT .i18n | head -1)
 
 check "SID_NEXT unchanged after deletion" test "$SID_NEXT_BEFORE" = "$SID_NEXT_AFTER"
-check_not_found "W_READY removed from .LANG.h" "LA_W5" .LANG.h
-check_not_found "READY removed from .LANG.c"   '"READY"' .LANG.c
-# Orphan SID 5 may still exist in LANG.cn.h (no automatic pruning)
-# This is expected behavior -- old translations remain until manually cleaned
+# Trickle mode: LA_W5 stays in .LANG.h with disabled prefix
+check_contains  "LA_W5 still in .LANG.h"          "LA_W5"        .LANG.h
+check_contains  "disabled in .LANG.h comment"      "disabled"     .LANG.h
+check_contains  "READY still in .LANG.c (disabled)" "disabled"    .LANG.c
+check_contains  "LA_W5 preserved in LANG.cn.h"     "LA_W5"       LANG.cn.h
+check_contains  "disabled import count"             "disabled string" /tmp/i18n_delete.log
 
-echo "  INFO: Orphan SID entries in LANG.cn.h (if any):"
-grep "SID:5" LANG.cn.h || echo "    (none found)"
+echo "  INFO: Disabled entries:"
+grep "disabled" .LANG.h || echo "    (none)"
 
 # Restore
 mv hello.c.stage9.bak hello.c
@@ -384,6 +387,85 @@ mv .LANG.h.debug .LANG.h
 mv .LANG.c.debug .LANG.c
 mv LANG.cn.h.debug LANG.cn.h
 echo "  Restored debug-mode products"
+
+# ---------------------------------------------------------------------------
+# Stage 11 -- Trickle mode full lifecycle: disabled → remove → deleted
+#   a) Delete W_READY → becomes "disabled"
+#   b) All three builds still compile (disabled entry has valid ID)
+#   c) User changes "disabled" to "remove" in .LANG.h
+#   d) Re-gen → debug: _LA_5 placeholder; release: entry removed
+#   e) Restore W_READY → entry reappears as active
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 11] Trickle mode full lifecycle ==="
+cp hello.c hello.c.stage11.bak
+cp .LANG.h .LANG.h.stage11.bak
+cp .LANG.c .LANG.c.stage11.bak
+cp LANG.cn.h LANG.cn.h.stage11.bak
+
+# Step a: Delete W_READY → disabled
+sed -i.tmp '/^#define W_READY/d' hello.c
+rm -f hello.c.tmp
+
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /tmp/i18n_trickle_a.log 2>&1
+
+check_contains  "11a: LA_W5 disabled in .LANG.h" 'disabled.*READY' .LANG.h
+check_contains  "11a: disabled in .LANG.c"        'disabled'        .LANG.c
+
+# Step b: All builds compile with disabled entry
+echo "  Building: hello (literal, with disabled entry) ..."
+make -s hello
+check "11b: hello builds (disabled entry)"       test -x hello
+check "11b: hello runs (disabled entry)"         ./hello
+
+echo "  Building: hello-i18n (with disabled entry) ..."
+make -s hello-i18n
+check "11b: hello-i18n builds (disabled entry)"  test -x hello-i18n
+check "11b: hello-i18n runs (disabled entry)"    ./hello-i18n
+
+inject_cn
+echo "  Building: hello-cn (with disabled entry) ..."
+make -s hello-cn
+check "11b: hello-cn builds (disabled entry)"    test -x hello-cn
+check "11b: hello-cn runs (disabled entry)"      ./hello-cn
+
+# Step c: User marks "disabled" → "remove" in .LANG.h
+sed -i.tmp 's|/\* disabled "READY"|/* remove "READY"|' .LANG.h
+rm -f .LANG.h.tmp
+check_contains  "11c: remove in .LANG.h" 'remove.*READY' .LANG.h
+
+# Step d: Re-gen in debug mode → _LA_5 placeholder
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /tmp/i18n_trickle_d.log 2>&1
+
+check_contains  "11d: _LA_5 placeholder in .LANG.h" '_LA_5' .LANG.h
+check_not_found "11d: no LA_W5 active in .LANG.h"   'LA_W5' .LANG.h
+check_not_found "11d: READY removed from .LANG.c"   'READY' .LANG.c
+
+# Step d2: Re-gen in ndebug mode → entry fully removed (no _LA_5)
+cp .LANG.h .LANG.h.remove_debug
+cp .LANG.c .LANG.c.remove_debug
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --ndebug --import cn) > /dev/null 2>&1
+check_not_found "11d: no _LA_5 in ndebug .LANG.h"   '_LA_5' .LANG.h
+check_not_found "11d: no READY in ndebug .LANG.h"   'READY' .LANG.h
+# Restore debug products for step e
+mv .LANG.h.remove_debug .LANG.h
+mv .LANG.c.remove_debug .LANG.c
+
+# Step e: Restore W_READY → entry reappears as active
+mv hello.c.stage11.bak hello.c
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /tmp/i18n_trickle_e.log 2>&1
+
+check_contains  "11e: LA_W5 active again in .LANG.h" 'LA_W5'  .LANG.h
+check_not_found "11e: no disabled in .LANG.h"         'disabled.*READY' .LANG.h
+check_not_found "11e: no remove in .LANG.h"           'remove.*READY'   .LANG.h
+check_contains  "11e: READY back in .LANG.c"          'READY'  .LANG.c
+
+# Settle back to clean state
+inject_cn
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /dev/null 2>&1
+
+# Restore backups
+rm -f .LANG.h.stage11.bak .LANG.c.stage11.bak LANG.cn.h.stage11.bak
 
 # ---------------------------------------------------------------------------
 # 汇总

@@ -439,7 +439,25 @@ _cc_and_flags_for_file() {
             printf '%s' "$_result"
             return
         fi
-        # awk 无输出：此文件不在 compile_commands.json 中，继续走兜底逻辑
+        # awk 无输出：此文件不在 compile_commands.json 中
+        # .h 文件：尝试从同目录下的 .c 文件借用编译参数
+        case "$_f" in
+        *.h)
+            local _dir; _dir=$(dirname "$_f")
+            local _sibling
+            _sibling=$(awk '/"file"/ {
+                s=$0; sub(/.*"file"[[:space:]]*:[[:space:]]*"/, "", s); sub(/".*$/, "", s)
+                print s
+            }' "$_compdb" | grep "^${_dir}/.*\.c$" | head -1)
+            if [ -n "$_sibling" ]; then
+                _result=$(_cc_and_flags_for_file "$_sibling")
+                if [ -n "$_result" ]; then
+                    printf '%s' "$_result"
+                    return
+                fi
+            fi
+            ;;
+        esac
     fi
     # 兜底：host cc + compile_flags.txt
     local _flags=""
@@ -643,7 +661,8 @@ if [ "$total" -eq 0 ]; then
     exit 0
 fi
 
-# 从当前（旧）.LANG.c 中提取 SID→字符串 映射（变更检测用，必须在覆写 .c 前完成）
+# 从当前（旧）.LANG.c 中提取 SID→类型→字符串 映射（变更检测用，必须在覆写 .c 前完成）
+# 格式: SID|TYPE|string   （TYPE = W/S/F）
 if [ -f "$OUTPUT_C" ]; then
     awk '
     /SID:[0-9]/ {
@@ -658,6 +677,11 @@ if [ -f "$OUTPUT_C" ]; then
             else break
         }
         if (entry_sid == "" || entry_sid+0 == 0) next
+        # 提取类型（从 [LA_W...] / [LA_S...] / [LA_F...] 中获取）
+        entry_type = "F"
+        if (match(line, /\[LA_[WSF]/)) entry_type = substr(line, RSTART+4, 1)
+        else if (line ~ /\[LA_W/) entry_type = "W"
+        else if (line ~ /\[LA_S/) entry_type = "S"
         s = line; sub(/.*= "/, "", s)
         val = ""
         for (ci = 1; ci <= length(s); ci++) {
@@ -666,18 +690,42 @@ if [ -f "$OUTPUT_C" ]; then
             else if (ch == "\"") break
             else val = val ch
         }
-        if (entry_sid != "" && val != "") print entry_sid "|" val
+        if (entry_sid != "" && val != "") print entry_sid "|" entry_type "|" val
     }
     ' "$OUTPUT_C" > "$TEMP_OLD_SID_MAP" 2>/dev/null || true
 else
     : > "$TEMP_OLD_SID_MAP"
 fi
 
+# 从当前（旧）.LANG.h 中提取条目状态（disabled / remove）
+# 格式: SID|TYPE|status   （status 为空=active, disabled, remove）
+TEMP_OLD_ENUM_STATUS=$(mktemp)
+: > "$TEMP_OLD_ENUM_STATUS"
+if [ -f "$OUTPUT_H" ]; then
+    awk '
+    /LA_[WSF][0-9]+,/ {
+        line = $0
+        # 提取 LA_X{SID}
+        idx = match(line, /LA_[WSF][0-9]+/)
+        if (idx > 0) {
+            m = substr(line, RSTART, RLENGTH)
+            t = substr(m, 4, 1)
+            sid = substr(m, 5) + 0
+            status = ""
+            if (line ~ /\/\* disabled /) status = "disabled"
+            else if (line ~ /\/\* remove /) status = "remove"
+            print sid "|" t "|" status
+        }
+    }
+    ' "$OUTPUT_H" > "$TEMP_OLD_ENUM_STATUS" 2>/dev/null || true
+fi
+
 # ======================================================================
 # Phase 1: 收集所有条目（SID 分配 + TEMP_MAP / TEMP_ENUM_DATA）
 # ======================================================================
 # TEMP_MAP 格式:       TYPE|key|id_name|sid   （源文件回写用）
-# TEMP_ENUM_DATA 格式: TYPE|id_name|sid|str|files_formatted[|params]
+# TEMP_ENUM_DATA 格式: TYPE|id_name|sid|str|files_formatted|params|status
+#   status: 空=active, disabled=已禁用, remove=待删除
 #
 # NDEBUG 模式: id_name = LA_{T}{seq}（紧凑连续）
 # Debug 模式:  id_name = LA_{T}{sid}（SID 稳定映射）
@@ -749,6 +797,46 @@ if [ "$format_count" -gt 0 ]; then
 fi
 
 # ======================================================================
+# Phase 1b: 收集禁用条目（旧 .LANG.c 中存在但本次未扫描到的）
+# ======================================================================
+# Trickle 模式：宏开关变化时，消失的条目标记为 disabled（保留 ID 和字符串），
+# 下次宏启用时自动恢复。用户可在 .LANG.h 中将 disabled 改为 remove 确认删除。
+_disabled_count=0
+if [ -s "$TEMP_OLD_SID_MAP" ]; then
+    # 收集当前有效的 SID 集合
+    awk -F'|' '{print $4}' "$TEMP_MAP" > "${TEMP_ALL}.active_sids"
+    sort -u -o "${TEMP_ALL}.active_sids" "${TEMP_ALL}.active_sids"
+
+    while IFS='|' read -r old_sid old_type old_str; do
+        # 跳过已在当前扫描中的活跃条目
+        if grep -q "^${old_sid}$" "${TEMP_ALL}.active_sids" 2>/dev/null; then
+            continue
+        fi
+
+        # 检查旧 .LANG.h 中的状态
+        _old_st=$(awk -F'|' -v s="$old_sid" '$1==s {print $3; exit}' "$TEMP_OLD_ENUM_STATUS")
+
+        if [ "$_old_st" = "remove" ]; then
+            # 用户已确认删除 — debug 模式留空洞（_LA_N），release 模式直接移除
+            # 不加入 TEMP_ENUM_DATA，在枚举中自然成为 _LA_N 空洞
+            continue
+        fi
+
+        # 标记为 disabled（保留 ID + 字符串，等待宏重新启用）
+        id_name="LA_${old_type}${old_sid}"
+        str_out="$old_str"
+        # 如果是 F 类型且不含 %，需要保留 _fmt_ensure_prefix 的前缀
+        if [ "$old_type" = "F" ]; then
+            str_out=$(_fmt_ensure_prefix "$old_str")
+        fi
+        printf '%s|%s|%s|%s||%s|disabled\n' "$old_type" "$id_name" "$old_sid" "$str_out" "" >> "$TEMP_ENUM_DATA"
+        [ "$old_sid" -gt "$max_sid" ] && max_sid=$old_sid
+        _disabled_count=$((_disabled_count + 1))
+    done < "$TEMP_OLD_SID_MAP"
+    rm -f "${TEMP_ALL}.active_sids"
+fi
+
+# ======================================================================
 # Phase 2: 生成 .LANG.h
 # ======================================================================
 #
@@ -758,9 +846,32 @@ fi
 
 cat > "$OUTPUT_H" <<'EOF'
 /*
- * Auto-generated language IDs
+ * 自动生成的语言 ID 枚举（由 i18n.sh 生成）
  *
- * DO NOT EDIT - Regenerate with: ./i18n/i18n.sh
+ * 除「remove 操作」外请勿手动编辑，重新生成会覆盖所有改动。
+ *
+ * 条目状态:
+ *   (无标记)  — active:   正常使用中，源文件中有对应的 LA_W/S/F 调用
+ *   disabled  — disabled: 源文件扫描中未出现（如在未激活的 #ifdef 分支内），
+ *                         ID 和字符串保留，宏重新启用后自动恢复为 active
+ *   remove    — remove:   用户确认永久删除，下次生成时:
+ *                           Debug  模式 → 该位置变为 _LA_N 占位空洞
+ *                           Release 模式 → 该条目被完全移除
+ *
+ * 状态流转:
+ *   active ──(扫描消失)──→ disabled ──(扫描重现)──→ active
+ *                              │
+ *                     (用户手动改为 remove)
+ *                              ↓
+ *                           remove ──(下次生成)──→ 删除
+ *
+ * 操作说明:
+ *   若在枚举注释中看到 "disabled" 前缀，且确认该字符串不再需要，
+ *   将注释中的 "disabled" 改为 "remove"，然后重新运行 i18n.sh 即可。
+ *   示例:
+ *     LA_F99,  // disabled "some old string"
+ *     改为:
+ *     LA_F99,  // remove "some old string"
  */
 
 #ifndef LANG_H__
@@ -774,9 +885,12 @@ EOF
 
 if [ "$NDEBUG_MODE" -eq 1 ]; then
     # --ndebug: 按类型分组，连续编号（紧凑模式）
+    # Release 模式下 disabled 和 remove 条目均被移除
     _emit_enum_grouped() {
         local _cur_type=""
-        while IFS='|' read -r etype eid esid estr efiles eparams; do
+        while IFS='|' read -r etype eid esid estr efiles eparams estatus; do
+            # Release 模式跳过 disabled / remove 条目
+            [ "$estatus" = "disabled" ] || [ "$estatus" = "remove" ] && continue
             if [ "$etype" != "$_cur_type" ]; then
                 [ -n "$_cur_type" ] && echo ""
                 _cur_type="$etype"
@@ -806,11 +920,12 @@ if [ "$NDEBUG_MODE" -eq 1 ]; then
     } >> "$OUTPUT_H"
 else
     # Debug: 按 SID 顺序排列，空洞用占位符填充
+    # disabled 条目保留 ID 但注释加 disabled 前缀
     awk -F'|' -v max_sid="$max_sid" '
     {
         sid = $3 + 0
         type[sid] = $1; eid[sid] = $2; estr[sid] = $4
-        efiles[sid] = $5; eparams[sid] = $6
+        efiles[sid] = $5; eparams[sid] = $6; estatus[sid] = $7
     }
     END {
         cur_type = ""
@@ -823,10 +938,14 @@ else
                     else if (cur_type == "S") printf "    /* Strings (LA_S) */\n"
                     else if (cur_type == "F") printf "    /* Formats (LA_F) */\n"
                 }
+                prefix = ""
+                if (estatus[s] == "disabled") prefix = "disabled "
                 if (type[s] == "F" && eparams[s] != "")
-                    cmt = "/* \"" estr[s] "\" (" eparams[s] ")  [" efiles[s] "] */"
+                    cmt = "/* " prefix "\"" estr[s] "\" (" eparams[s] ")  [" efiles[s] "] */"
+                else if (efiles[s] != "")
+                    cmt = "/* " prefix "\"" estr[s] "\"  [" efiles[s] "] */"
                 else
-                    cmt = "/* \"" estr[s] "\"  [" efiles[s] "] */"
+                    cmt = "/* " prefix "\"" estr[s] "\" */"
                 printf "    %s,  %s\n", eid[s], cmt
             } else {
                 printf "    _LA_%d,\n", s
@@ -939,6 +1058,16 @@ if [ "$format_count" -gt 0 ]; then
         entry_sid=$(_I18N_KEY="$key" awk -F'|' -v t="F" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $4; exit}' "$TEMP_MAP")
         printf '    [%s] = "%s",  /* SID:%s */\n' "${id_name:-LA_F0}" "$escaped" "${entry_sid:-0}" >> "$OUTPUT_C"
     done < "$TEMP_FORMATS"
+fi
+
+# disabled 条目（保留字符串以便宏重新启用时直接可用）
+if [ "$_disabled_count" -gt 0 ]; then
+    awk -F'|' '$7 == "disabled" {
+        id = $2; sid = $3; str = $4
+        # 转义双引号
+        gsub(/"/, "\\\"", str)
+        printf "    [%s] = \"%s\",  /* SID:%s disabled */\n", id, str, sid
+    }' "$TEMP_ENUM_DATA" >> "$OUTPUT_C"
 fi
 
 cat >> "$OUTPUT_C" <<EOF
@@ -1077,7 +1206,7 @@ if [ -n "$IMPORT_SUFFIX" ]; then
         # 构建 英文→翻译 映射（结合 TEMP_OLD_SID_MAP 和 TEMP_OLD_IMPORT_MAP）
         # 无论英文和翻译是否相同都保留（用于 SID 变更时的内容匹配）
         awk -F'|' '
-        NR==FNR { sid_en[$1]=$2; next }  # 第一文件: SID→英文
+        NR==FNR { sid_en[$1]=$3; next }  # 第一文件: SID→英文（字段: SID|TYPE|string）
         { sid=$1; trans=$2; en=sid_en[sid]; if(en!="") print en"|"trans }
         ' "$TEMP_OLD_SID_MAP" "$TEMP_OLD_IMPORT_MAP" > "$TEMP_EN_TRANS_MAP" 2>/dev/null || true
     fi
@@ -1106,7 +1235,7 @@ EOF
         _id_name=$(_I18N_KEY="$_key" awk -F'|' -v t="$_type" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $3; exit}' "$TEMP_MAP")
         _entry_sid=$(_I18N_KEY="$_key" awk -F'|' -v t="$_type" 'BEGIN{k=ENVIRON["_I18N_KEY"]} $1==t && $2==k {print $4; exit}' "$TEMP_MAP")
         _old_translation=$(awk -F'|' -v s="${_entry_sid:-0}" '$1==s {print $2; exit}' "$TEMP_OLD_IMPORT_MAP")
-        _old_english=$(awk -F'|' -v s="${_entry_sid:-0}" '$1==s {print $2; exit}' "$TEMP_OLD_SID_MAP")
+        _old_english=$(awk -F'|' -v s="${_entry_sid:-0}" '$1==s {print $3; exit}' "$TEMP_OLD_SID_MAP")
         # 如果按 SID 找不到旧翻译，尝试按英文内容查找（处理 ID 变更情况）
         if [ -z "${_old_translation:-}" ]; then
             _old_translation=$(_I18N_ESC="$_escaped" awk -F'|' 'BEGIN{e=ENVIRON["_I18N_ESC"]} $1==e {print $2; exit}' "$TEMP_EN_TRANS_MAP")
@@ -1154,22 +1283,35 @@ EOF
         done < "$TEMP_FORMATS"
     fi
 
-    # 失效的 SID：保留旧翻译，ID 改为 _LA_{SID}
-    _invalid_count=0
-    if [ -s "$TEMP_OLD_IMPORT_MAP" ]; then
-        # 收集当前有效的 SID 集合
-        awk -F'|' '{print $4}' "$TEMP_MAP" | sort -u > "$TEMP_OLD_IMPORT_MAP.valid"
-        # 遍历旧翻译，找出失效的 SID
-        while IFS='|' read -r old_sid old_trans; do
-            # 检查该 SID 是否仍有效
-            if ! grep -q "^${old_sid}$" "$TEMP_OLD_IMPORT_MAP.valid" 2>/dev/null; then
-                # 失效：输出 [_LA_{SID}] = "旧翻译"
-                printf '    [_LA_%s] = "%s",  /* SID:%s invalid */\n' \
-                    "$old_sid" "$old_trans" "$old_sid" >> "$OUTPUT_IMPORT_H"
-                _invalid_count=$((_invalid_count + 1))
+    # Trickle 模式：disabled 条目以真实 ID 保留（.cn.h 无状态标记）
+    #              remove 条目仅 debug 模式保留为 _LA_N 空洞
+    _disabled_import_count=0
+    _remove_count=0
+    if [ "$_disabled_count" -gt 0 ]; then
+        while IFS='|' read -r d_type d_id d_sid d_str _d5 _d6 d_status; do
+            [ "$d_status" != "disabled" ] && continue
+            d_trans=$(awk -F'|' -v s="$d_sid" '$1==s {print $2; exit}' "$TEMP_OLD_IMPORT_MAP")
+            d_escaped=$(printf '%s' "$d_str" | sed 's/"/\\"/g')
+            if [ -z "$d_trans" ]; then
+                printf '    [%s] = "%s",  /* SID:%s new */\n' "$d_id" "$d_escaped" "$d_sid" >> "$OUTPUT_IMPORT_H"
+                _new_count=$((_new_count + 1))
+            else
+                printf '    [%s] = "%s",  /* SID:%s */\n' "$d_id" "$d_trans" "$d_sid" >> "$OUTPUT_IMPORT_H"
             fi
-        done < "$TEMP_OLD_IMPORT_MAP"
-        rm -f "$TEMP_OLD_IMPORT_MAP.valid"
+            _disabled_import_count=$((_disabled_import_count + 1))
+        done < "$TEMP_ENUM_DATA"
+    fi
+    if [ "$NDEBUG_MODE" -ne 1 ] && [ -s "$TEMP_OLD_ENUM_STATUS" ]; then
+        # debug 模式：remove 条目保留为 _LA_N 空洞（保留旧翻译供参考）
+        while IFS='|' read -r r_sid _r_type r_status; do
+            [ "$r_status" != "remove" ] && continue
+            # 若该 SID 在本次扫描中重新出现（已恢复为 active），跳过
+            awk -F'|' -v s="$r_sid" '$3==s {found=1; exit} END{exit !found}' "$TEMP_ENUM_DATA" && continue
+            r_trans=$(awk -F'|' -v s="$r_sid" '$1==s {print $2; exit}' "$TEMP_OLD_IMPORT_MAP")
+            [ -z "$r_trans" ] && continue
+            printf '    [_LA_%s] = "%s",  /* SID:%s remove */\n' "$r_sid" "$r_trans" "$r_sid" >> "$OUTPUT_IMPORT_H"
+            _remove_count=$((_remove_count + 1))
+        done < "$TEMP_OLD_ENUM_STATUS"
     fi
 
     # 生成尾部
@@ -1182,7 +1324,8 @@ static inline int lang_${IMPORT_SUFFIX}(void) {
 EOF
     [ "$_new_count" -gt 0 ]     && echo "  NOTE: $_new_count new string(s) added as English placeholders (marked /* new */)"
     [ "$_updated_count" -gt 0 ] && echo "  NOTE: $_updated_count string(s) English changed — old translation kept, marked /* [SID:N] UPDATED new: ... */"
-    [ "$_invalid_count" -gt 0 ] && echo "  NOTE: $_invalid_count invalidated string(s) kept with _LA_{SID} placeholder"
+    [ "$_disabled_import_count" -gt 0 ] && echo "  NOTE: $_disabled_import_count disabled string(s) preserved (trickle mode)"
+    [ "$_remove_count" -gt 0 ]  && echo "  NOTE: $_remove_count removed string(s) kept as _LA_N placeholder"
 fi
 
 echo "Generated:"

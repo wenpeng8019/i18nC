@@ -167,6 +167,11 @@ int lang_load(int la_id, const char* lang_table[], size_t num_lines) {
     return 0;
 }
 
+void lang_reset(int la_id) {
+    lang_instance_t* inst = get_instance(la_id);
+    if (inst) free_loaded_table(inst);
+}
+
 int lang_load_tx(int la_id, const char* text) {
     lang_instance_t* inst = get_instance(la_id);
     if (!inst || !text || !inst->lang_table) {

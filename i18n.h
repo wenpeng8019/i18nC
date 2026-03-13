@@ -70,4 +70,7 @@ int lang_load(int la_id, const char* lang_table[], size_t num_lines);
 int lang_load_tx(int la_id, const char* text);
 int lang_load_fp(int la_id, FILE *fp);
 
+/* 恢复为 lang_def() 注册的默认语言表 */
+void lang_reset(int la_id);
+
 #endif /* LANG_H */

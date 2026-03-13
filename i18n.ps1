@@ -319,6 +319,17 @@ function Get-CompilerFlagsForFile {
         }
     }
 
+    # .h 文件：尝试从同目录下的 .c 文件借用编译参数
+    if ($null -ne $CompDbData -and $FilePath -match '\.h$') {
+        $hDir = [System.IO.Path]::GetDirectoryName($absPath)
+        foreach ($entry in $CompDbData) {
+            $entryFile = [System.IO.Path]::GetFullPath($entry.file)
+            if ([System.IO.Path]::GetDirectoryName($entryFile) -eq $hDir -and $entryFile -match '\.c$') {
+                return (Get-CompilerFlagsForFile -FilePath $entryFile)
+            }
+        }
+    }
+
     # 兜底：默认编译器 + compile_flags.txt
     $flagStr = @()
     foreach ($cfpath in @("compile_flags.txt", (Join-Path $SourceDir "..\compile_flags.txt"))) {
@@ -641,9 +652,32 @@ $maxSid = 0
 
 $hLines = [System.Collections.Generic.List[string]]::new()
 $hLines.Add("/*")
-$hLines.Add(" * Auto-generated language IDs")
+$hLines.Add(" * 自动生成的语言 ID 枚举（由 i18n.bat 生成）")
 $hLines.Add(" *")
-$hLines.Add(" * DO NOT EDIT - Regenerate with: i18n\i18n.bat")
+$hLines.Add(" * 除「remove 操作」外请勿手动编辑，重新生成会覆盖所有改动。")
+$hLines.Add(" *")
+$hLines.Add(" * 条目状态:")
+$hLines.Add(" *   (无标记)  — active:   正常使用中，源文件中有对应的 LA_W/S/F 调用")
+$hLines.Add(" *   disabled  — disabled: 源文件扫描中未出现（如在未激活的 #ifdef 分支内），")
+$hLines.Add(" *                         ID 和字符串保留，宏重新启用后自动恢复为 active")
+$hLines.Add(" *   remove    — remove:   用户确认永久删除，下次生成时:")
+$hLines.Add(" *                           Debug  模式 → 该位置变为 _LA_N 占位空洞")
+$hLines.Add(" *                           Release 模式 → 该条目被完全移除")
+$hLines.Add(" *")
+$hLines.Add(" * 状态流转:")
+$hLines.Add(" *   active ──(扫描消失)──→ disabled ──(扫描重现)──→ active")
+$hLines.Add(" *                              │")
+$hLines.Add(" *                     (用户手动改为 remove)")
+$hLines.Add(" *                              ↓")
+$hLines.Add(" *                           remove ──(下次生成)──→ 删除")
+$hLines.Add(" *")
+$hLines.Add(" * 操作说明:")
+$hLines.Add(" *   若在枚举注释中看到 `"disabled`" 前缀，且确认该字符串不再需要，")
+$hLines.Add(" *   将注释中的 `"disabled`" 改为 `"remove`"，然后重新运行 i18n.bat 即可。")
+$hLines.Add(" *   示例:")
+$hLines.Add(" *     LA_F99,  // disabled `"some old string`"")
+$hLines.Add(" *     改为:")
+$hLines.Add(" *     LA_F99,  // remove `"some old string`"")
 $hLines.Add(" */")
 $hLines.Add("")
 $hLines.Add("#ifndef LANG_H__")
@@ -678,14 +712,14 @@ function Alloc-Entry {
 }
 
 # 收集所有条目的 enum 数据（SID 顺序索引用）
-$enumData = @{}   # SID -> @{Type; IdName; Str; Files; Params}
+$enumData = @{}   # SID -> @{Type; IdName; Str; Files; Params; Status}
 
 $wSeq = 0
 foreach ($line in $wordLines) {
     $parts = $line -split '\|', 5
     $eSid = if ($parts.Count -ge 5) { [int]$parts[4] } else { 0 }
     $r = Alloc-Entry -Type "W" -Key $parts[1] -SeqIdx $wSeq -ExistingSid $eSid
-    $enumData[$r.Sid] = @{ Type = "W"; IdName = $r.IdName; Str = $parts[2]; Files = ($parts[3] -replace ',', ', '); Params = "" }
+    $enumData[$r.Sid] = @{ Type = "W"; IdName = $r.IdName; Str = $parts[2]; Files = ($parts[3] -replace ',', ', '); Params = ""; Status = "" }
     $wSeq++
 }
 $sSeq = 0
@@ -693,7 +727,7 @@ foreach ($line in $stringLines) {
     $parts = $line -split '\|', 5
     $eSid = if ($parts.Count -ge 5) { [int]$parts[4] } else { 0 }
     $r = Alloc-Entry -Type "S" -Key $parts[1] -SeqIdx $sSeq -ExistingSid $eSid
-    $enumData[$r.Sid] = @{ Type = "S"; IdName = $r.IdName; Str = $parts[2]; Files = ($parts[3] -replace ',', ', '); Params = "" }
+    $enumData[$r.Sid] = @{ Type = "S"; IdName = $r.IdName; Str = $parts[2]; Files = ($parts[3] -replace ',', ', '); Params = ""; Status = "" }
     $sSeq++
 }
 $fSeq = 0; $firstFmtId = ""
@@ -702,15 +736,34 @@ foreach ($line in $formatLines) {
     $eSid = if ($parts.Count -ge 5) { [int]$parts[4] } else { 0 }
     $r = Alloc-Entry -Type "F" -Key $parts[1] -SeqIdx $fSeq -ExistingSid $eSid
     $params = ([regex]::Matches($parts[2], '%[sdifuxXclu]') | ForEach-Object { $_.Value }) -join ','
-    $enumData[$r.Sid] = @{ Type = "F"; IdName = $r.IdName; Str = $parts[2]; Files = ($parts[3] -replace ',', ', '); Params = $params }
+    $enumData[$r.Sid] = @{ Type = "F"; IdName = $r.IdName; Str = $parts[2]; Files = ($parts[3] -replace ',', ', '); Params = $params; Status = "" }
     if ($firstFmtId -eq "") { $firstFmtId = $r.IdName }
     $fSeq++
+}
+
+# --- Phase 1b: 收集禁用条目（旧 .LANG.c 中存在但本次未扫描到的）---
+# Trickle 模式：宏开关变化时，消失的条目标记为 disabled
+$disabledCount = 0
+$activeSids = @{}; $mapSid.Values | ForEach-Object { $activeSids[$_] = $true }
+foreach ($kv in $oldSidMap.GetEnumerator()) {
+    $oSid = $kv.Key
+    if ($activeSids.ContainsKey($oSid)) { continue }
+    $oStatus = if ($oldEnumStatus.ContainsKey($oSid)) { $oldEnumStatus[$oSid] } else { '' }
+    if ($oStatus -eq 'remove') { continue }  # 用户已确认删除
+    $oType = if ($oldSidType.ContainsKey($oSid)) { $oldSidType[$oSid] } else { 'F' }
+    $oStr = $kv.Value
+    if ($oType -eq 'F') { $oStr = EnsureFmtPrefix $oStr }
+    $idName = "LA_${oType}${oSid}"
+    $enumData[$oSid] = @{ Type = $oType; IdName = $idName; Str = $oStr; Files = ''; Params = ''; Status = 'disabled' }
+    if ($oSid -gt $maxSid) { $maxSid = $oSid }
+    $disabledCount++
 }
 
 # --- Phase 2: 生成 enum ---
 
 if ($NdebugMode) {
     # --ndebug: 按类型分组连续编号（紧凑模式）
+    # Release 模式下 disabled 和 remove 条目均被移除
     $curType = ""
     foreach ($line in $wordLines) {
         $parts = $line -split '\|', 5; $key = $parts[1]; $str = $parts[2]; $files = $parts[3] -replace ',', ', '
@@ -739,6 +792,7 @@ if ($NdebugMode) {
     if ($formatCount -gt 0) { $hLines.Add("") }
 } else {
     # Debug: 按 SID 顺序排列，空洞用占位符填充
+    # disabled 条目保留 ID 但注释加 disabled 前缀
     $curType = ""
     for ($s = 1; $s -le $maxSid; $s++) {
         if ($enumData.ContainsKey($s)) {
@@ -752,10 +806,13 @@ if ($NdebugMode) {
                     "F" { $hLines.Add("    /* Formats (LA_F) */") }
                 }
             }
+            $prefix = if ($e.Status -eq 'disabled') { 'disabled ' } else { '' }
             if ($e.Type -eq "F" -and $e.Params -ne "") {
-                $hLines.Add("    $($e.IdName),  /* `"$($e.Str)`" ($($e.Params))  [$($e.Files)] */")
+                $hLines.Add("    $($e.IdName),  /* ${prefix}`"$($e.Str)`" ($($e.Params))  [$($e.Files)] */")
+            } elseif ($e.Files -ne '') {
+                $hLines.Add("    $($e.IdName),  /* ${prefix}`"$($e.Str)`"  [$($e.Files)] */")
             } else {
-                $hLines.Add("    $($e.IdName),  /* `"$($e.Str)`"  [$($e.Files)] */")
+                $hLines.Add("    $($e.IdName),  /* ${prefix}`"$($e.Str)`" */")
             }
         } else {
             $hLines.Add("    _LA_$s,")
@@ -783,13 +840,32 @@ $hLines.Add("#endif /* LANG_H__ */")
 # 生成 .LANG.c
 # ============================================================================
 
-# 从旧 .LANG.c 提取 SID→字符串映射（变更检测用，必须在覆写前完成）
-$oldSidMap = @{}   # SID → en_string
+# 从旧 .LANG.c 提取 SID→类型→字符串映射（变更检测用，必须在覆写前完成）
+$oldSidMap = @{}     # SID → en_string
+$oldSidType = @{}    # SID → type (W/S/F)
 if (Test-Path $OutputC) {
     Get-Content $OutputC | ForEach-Object {
-        if ($_ -match '\[_?LA_[WSF]?\d+\]\s*=\s*"((?:[^"\\]|\\.)*)",\s*/\*\s*SID:(\d+)') {
-            $val = $Matches[1]; $s2 = [int]$Matches[2]
-            if ($s2 -gt 0 -and -not $oldSidMap.ContainsKey($s2)) { $oldSidMap[$s2] = $val }
+        if ($_ -match '\[_?LA_([WSF])?\d+\]\s*=\s*"((?:[^"\\]|\\.)*)",\s*/\*\s*SID:(\d+)') {
+            $t = if ($Matches[1]) { $Matches[1] } else { 'F' }
+            $val = $Matches[2]; $s2 = [int]$Matches[3]
+            if ($s2 -gt 0 -and -not $oldSidMap.ContainsKey($s2)) {
+                $oldSidMap[$s2] = $val
+                $oldSidType[$s2] = $t
+            }
+        }
+    }
+}
+
+# 从旧 .LANG.h 提取条目状态（disabled / remove）
+$oldEnumStatus = @{}   # SID → status ('disabled' / 'remove' / '')
+if (Test-Path $OutputH) {
+    Get-Content $OutputH | ForEach-Object {
+        if ($_ -match 'LA_([WSF])(\d+),') {
+            $sSid = [int]$Matches[2]
+            $status = ''
+            if ($_ -match '/\*\s*disabled\s') { $status = 'disabled' }
+            elseif ($_ -match '/\*\s*remove\s') { $status = 'remove' }
+            $oldEnumStatus[$sSid] = $status
         }
     }
 }
@@ -842,6 +918,16 @@ foreach ($line in $formatLines) {
     $strOut = EnsureFmtPrefix $str
     $cLines.Add("    [$idName] = `"$(Escape-CString $strOut)`",  /* SID:$eSid */")
     $fid++
+}
+
+# disabled 条目（保留字符串以便宏重新启用时直接可用）
+if ($disabledCount -gt 0) {
+    foreach ($kv in $enumData.GetEnumerator()) {
+        $e = $kv.Value
+        if ($e.Status -ne 'disabled') { continue }
+        $escaped = Escape-CString $e.Str
+        $cLines.Add("    [$($e.IdName)] = `"$escaped`",  /* SID:$($kv.Key) disabled */")
+    }
 }
 
 $cLines.Add("};")
@@ -957,15 +1043,37 @@ if ($ImportSuffix -ne "") {
         Add-ImportEntry -Type "F" -Key $parts[1] -Escaped (Escape-CString $strOut)
     }
 
-    # 失效的 SID：保留旧翻译，ID 改为 _LA_{SID}
-    $validSids = @{}
-    $mapSid.Values | ForEach-Object { $validSids[$_] = $true }
-    $invalidCount = 0
-    foreach ($kv in $oldImportMap.GetEnumerator()) {
-        $oldSid = $kv.Key
-        if (-not $validSids.ContainsKey($oldSid)) {
-            $iLines.Add("    [_LA_$oldSid] = `"$($kv.Value)`",  /* SID:$oldSid invalid */")
-            $invalidCount++
+    # Trickle 模式：disabled 条目以真实 ID 保留（.cn.h 无状态标记）
+    #              remove 条目仅 debug 模式保留为 _LA_N 空洞
+    $disabledImportCount = 0
+    $removeCount = 0
+    if ($disabledCount -gt 0) {
+        foreach ($kv in $enumData.GetEnumerator()) {
+            $e = $kv.Value
+            if ($e.Status -ne 'disabled') { continue }
+            $dSid = $kv.Key
+            $dTrans = if ($oldImportMap.ContainsKey($dSid)) { $oldImportMap[$dSid] } else { $null }
+            $dEscaped = Escape-CString $e.Str
+            if ($null -eq $dTrans) {
+                $iLines.Add("    [$($e.IdName)] = `"$dEscaped`",  /* SID:$dSid new */")
+                $newCount++
+            } else {
+                $iLines.Add("    [$($e.IdName)] = `"$dTrans`",  /* SID:$dSid */")
+            }
+            $disabledImportCount++
+        }
+    }
+    if (-not $NdebugMode) {
+        # debug 模式：remove 条目保留为 _LA_N 空洞（保留旧翻译供参考）
+        foreach ($kv in $oldEnumStatus.GetEnumerator()) {
+            if ($kv.Value -ne 'remove') { continue }
+            $rSid = $kv.Key
+            # 若该 SID 在本次扫描中重新出现（已恢复为 active），跳过
+            if ($enumData.ContainsKey($rSid)) { continue }
+            $rTrans = if ($oldImportMap.ContainsKey($rSid)) { $oldImportMap[$rSid] } else { $null }
+            if ($null -eq $rTrans) { continue }
+            $iLines.Add("    [_LA_$rSid] = `"$rTrans`",  /* SID:$rSid remove */")
+            $removeCount++
         }
     }
 
@@ -975,9 +1083,10 @@ if ($ImportSuffix -ne "") {
     $iLines.Add("    return lang_load(LA_RID, s_lang_${ImportSuffix}, LA_NUM);")
     $iLines.Add("}")
     [System.IO.File]::WriteAllLines($importH, $iLines, [System.Text.UTF8Encoding]::new($false))
-    if ($newCount -gt 0)     { Write-Host "  NOTE: $newCount new string(s) added as English placeholders (marked /* new */)" }
-    if ($updatedCount -gt 0) { Write-Host "  NOTE: $updatedCount string(s) English changed — old translation kept, marked /* [SID:N] UPDATED new: ... */" }
-    if ($invalidCount -gt 0) { Write-Host "  NOTE: $invalidCount invalidated string(s) kept with _LA_{SID} placeholder" }
+    if ($newCount -gt 0)            { Write-Host "  NOTE: $newCount new string(s) added as English placeholders (marked /* new */)" }
+    if ($updatedCount -gt 0)        { Write-Host "  NOTE: $updatedCount string(s) English changed — old translation kept, marked /* [SID:N] UPDATED new: ... */" }
+    if ($disabledImportCount -gt 0) { Write-Host "  NOTE: $disabledImportCount disabled string(s) preserved (trickle mode)" }
+    if ($removeCount -gt 0)         { Write-Host "  NOTE: $removeCount removed string(s) kept as _LA_N placeholder" }
 }
 
 # ============================================================================

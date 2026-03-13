@@ -33,7 +33,7 @@
 #ifdef I18N_ENABLED
 /*
  * LANG.h includes:
- *   - .LANG.h  (auto-generated enum LA_W0..LA_NUM and lang_en[] declaration)
+ *   - .LANG.h  (auto-generated enum LA_W0..LA_NUM)
  *   - lang_init() helper that calls lang_def() to register the English table
  */
 #  include "LANG.h"
@@ -53,39 +53,39 @@
  * ============================================================================ */
 
 /* LA_W -- status words (single words or very short tokens) */
-#define W_ERROR  LA_W("ERROR",  LA_W0, 1)
-#define W_FAIL   LA_W("FAIL",   LA_W1, 2)
-#define W_OK     LA_W("OK",     LA_W2, 3)
-#define W_PASS   LA_W("PASS",   LA_W3, 4)
-#define W_READY  LA_W("READY",  LA_W4, 5)
+#define W_ERROR  LA_W("ERROR",  LA_W1, 1)
+#define W_FAIL   LA_W("FAIL",   LA_W2, 2)
+#define W_OK     LA_W("OK",     LA_W3, 3)
+#define W_PASS   LA_W("PASS",   LA_W4, 4)
+#define W_READY  LA_W("READY",  LA_W5, 5)
 
 /* Wide/Unicode string prefix tests (u"", L"", U"", u8"") */
-#define W_UTF16  LA_W(u"UTF16",  LA_W5, 6)
-#define W_WIDE   LA_W(L"WIDE",   LA_W7, 8)
-#define W_UTF32  LA_W(U"UTF32",  LA_W6, 7)
+#define W_UTF16  LA_W(u"UTF16",  LA_W6, 6)
+#define W_WIDE   LA_W(L"WIDE",   LA_W8, 8)
+#define W_UTF32  LA_W(U"UTF32",  LA_W7, 7)
 
 /* LA_S -- complete sentences */
-#define S_ALL_PASS  LA_S("All tests passed.",  LA_S0, 9)
-#define S_HELLO     LA_S("Hello, World!",      LA_S1, 10)
-#define S_SOME_FAIL LA_S("Some tests FAILED.", LA_S2, 11)
-#define S_WELCOME   LA_S("Welcome to i18n.",   LA_S4, 13)
-#define S_UTF8      LA_S(u8"UTF-8 String",     LA_S3, 12)
+#define S_ALL_PASS  LA_S("All tests passed.",  LA_S9, 9)
+#define S_HELLO     LA_S("Hello, World!",      LA_S10, 10)
+#define S_SOME_FAIL LA_S("Some tests FAILED.", LA_S11, 11)
+#define S_WELCOME   LA_S("Welcome to i18n.",   LA_S13, 13)
+#define S_UTF8      LA_S(u8"UTF-8 String",     LA_S12, 12)
 
 /* LA_F -- printf format strings (variadic args passed at the call site)
  * Example:  printf(F_RESULT, W_PASS, "test name")
  *           printf(F_COUNT, 42)                       */
-#define F_RESULT  LA_F("  [%s] %s\n",    LA_F0, 14)
-#define F_LANG    LA_F("Language: %s\n", LA_F1, 15)
-#define F_COUNT   LA_F("Tests run: %d\n",LA_F2, 16)
+#define F_RESULT  LA_F("  [%s] %s\n",    LA_F14, 14)
+#define F_LANG    LA_F("Language: %s\n", LA_F15, 15)
+#define F_COUNT   LA_F("Tests run: %d\n",LA_F16, 16)
 
 /* LA_F without % -- i18n.sh should auto-add "% " prefix in generated code */
-#define F_PLAIN   LA_F("hello world",    LA_F3, 17)
+#define F_PLAIN   LA_F("hello world",    LA_F17, 17)
 
 /* Deduplication tests -- these should merge to existing IDs */
-#define W_OK_DUP1   LA_W("OK",    LA_W2, 3)  /* Should merge to LA_W3 (same as W_OK) */
-#define W_OK_DUP2   LA_W("ok",    LA_W2, 3)  /* LA_W trims+lowercase: ok -> OK -> LA_W3 */
-#define W_OK_DUP3   LA_W(" OK ",  LA_W2, 3)  /* Trim spaces -> OK -> LA_W3 */
-#define S_HELLO_DUP LA_S("Hello, World!", LA_S1, 10)  /* Should merge to LA_S7 (same as S_HELLO) */
+#define W_OK_DUP1   LA_W("OK",    LA_W3, 3)  /* Should merge to LA_W3 (same as W_OK) */
+#define W_OK_DUP2   LA_W("ok",    LA_W3, 3)  /* LA_W trims+lowercase: ok -> OK -> LA_W3 */
+#define W_OK_DUP3   LA_W(" OK ",  LA_W3, 3)  /* Trim spaces -> OK -> LA_W3 */
+#define S_HELLO_DUP LA_S("Hello, World!", LA_S10, 10)  /* Should merge to LA_S7 (same as S_HELLO) */
 
 /* ============================================================================
  * Minimal test framework
@@ -116,7 +116,9 @@ static void test_literals(void)
     CHECK("W_ERROR == \"ERROR\"",        strcmp(W_ERROR,  "ERROR")         == 0);
     CHECK("W_PASS  == \"PASS\"",         strcmp(W_PASS,   "PASS")          == 0);
     CHECK("W_FAIL  == \"FAIL\"",         strcmp(W_FAIL,   "FAIL")          == 0);
+#ifdef W_READY
     CHECK("W_READY == \"READY\"",        strcmp(W_READY,  "READY")         == 0);
+#endif
     CHECK("S_HELLO == \"Hello, World!\"",strcmp(S_HELLO,  "Hello, World!") == 0);
     CHECK("S_WELCOME contains i18n",     strstr(S_WELCOME,"i18n") != NULL);
     CHECK("F_RESULT contains %s",        strstr(F_RESULT, "%s")   != NULL);
@@ -156,7 +158,7 @@ static void test_literals(void)
 /* ============================================================================
  * Test 2 -- lang_load_tx (I18N mode only)
  * Load a Chinese translation from an in-memory text block and verify it.
- * String order must exactly match .LANG.c lang_en[]:
+ * String order must exactly match .LANG.c s_lang_en[]:
  *   W1..W8  (ERROR, FAIL, OK, PASS, READY, UTF16, UTF32, WIDE)
  *   S9..S13 (All tests passed, Hello World, Some tests FAILED, UTF-8 String, Welcome to i18n)
  *   F14..F17 (RESULT, LANG, COUNT, PLAIN)
@@ -207,7 +209,7 @@ static void test_load_tx(void)
     CHECK("bad format spec rejected", bad_ok != 0);
 
     /* Restore English table */
-    lang_load(LA_RID, lang_en, LA_NUM);
+    lang_reset(LA_RID);
     CHECK("after reload: W_OK == \"OK\"", strcmp(W_OK, "OK") == 0);
 }
 #endif  /* I18N_ENABLED */
@@ -228,7 +230,7 @@ static void test_static_cn(void)
     CHECK("F_COUNT has %%d",              strstr(F_COUNT, "%d")    != NULL);
 
     /* Restore English */
-    lang_load(LA_RID, lang_en, LA_NUM);
+    lang_reset(LA_RID);
     CHECK("restored: W_OK == \"OK\"",     strcmp(W_OK, "OK")        == 0);
 }
 #endif
