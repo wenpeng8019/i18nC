@@ -37,7 +37,7 @@ die() { echo "FATAL: $1" >&2; exit 1; }
 # 准备：清除所有生成产物
 # ---------------------------------------------------------------------------
 echo "=== [SETUP] Clean generated files ==="
-rm -f hello hello-i18n hello-cn .LANG.h .LANG.c .i18n LANG.cn.h hello.c.bak
+rm -f hello hello-i18n hello-cn .LANG.h .LANG.c .i18n LANG.cn.h hello.c.bak lang.en
 # LANG.h is auto-created by i18n.sh on first run; remove it here to test the full flow
 rm -f LANG.h
 
@@ -55,9 +55,9 @@ check_file "LANG.h auto-created" "LANG.h"
 check_contains "LA_NUM defined"  "LA_NUM"    ".LANG.h"
 check_contains "lang_en defined" "lang_en"   ".LANG.c"
 check_contains "SID_NEXT in .i18n" "SID_NEXT" ".i18n"
-# Expected: 8W (5 unique + 3 wide) + 5S (4 unique + 1 utf8) + 4F (3+1 plain) = 17 strings → SID_NEXT=18
+# Expected: 8W (5 unique + 3 wide) + 6S (5 unique + 1 utf8) + 4F (3+1 plain) = 18 strings → SID_NEXT=19
 # Dedup (W_OK_DUP*, S_HELLO_DUP) merge to existing IDs, don't allocate new SIDs.
-check_contains "SID_NEXT=18"     "SID_NEXT=18" ".i18n"
+check_contains "SID_NEXT=19"     "SID_NEXT=19" ".i18n"
 check_contains "LA_FMT_START in .LANG.h" "LA_FMT_START" ".LANG.h"
 
 # ---------------------------------------------------------------------------
@@ -152,8 +152,8 @@ echo "=== [Stage 4] First --import cn (all new) ==="
 (cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /tmp/i18n_import1.log 2>&1
 
 check_file "LANG.cn.h created"           "LANG.cn.h"
-# 应报告 17 条新字符串（8W + 5S + 4F）
-check_contains "NOTE: 17 new" "NOTE: 17 new" /tmp/i18n_import1.log
+# 应报告 18 条新字符串（8W + 6S + 4F）
+check_contains "NOTE: 18 new" "NOTE: 18 new" /tmp/i18n_import1.log
 # 新条目含 "/* SID:N new */" 注释
 check_contains "new comment in LANG.cn.h" "new \*/" LANG.cn.h
 
@@ -172,8 +172,8 @@ inject_cn() {
 import re, sys
 
 # Chinese translation table indexed by SID.
-# Format strings (SID 14-17) use "\\n" (two chars) as the C escape sequence.
-# SID allocation (17 strings): W1-W8 (1-8), S9-S13 (9-13), F14-F17 (14-17)
+# Format strings (SID 15-18) use "\\n" (two chars) as the C escape sequence.
+# SID allocation (18 strings): W1-W8 (1-8), S9-S14 (9-14), F15-F18 (15-18)
 translations = {
     1:  "\u9519\u8bef",           # W_ERROR: 错误
     2:  "\u5931\u8d25",           # W_FAIL:  失败
@@ -185,13 +185,14 @@ translations = {
     8:  "WIDE",                   # W_WIDE
     9:  "\u5168\u90e8\u6d4b\u8bd5\u901a\u8fc7\u3002",         # S_ALL_PASS: 全部测试通过。
     10: "\u4f60\u597d\uff0c\u4e16\u754c\uff01",               # S_HELLO:    你好，世界！
-    11: "\u90e8\u5206\u6d4b\u8bd5\u5931\u8d25\u3002",         # S_SOME_FAIL:部分测试失败。
-    12: "UTF-8 \u5b57\u7b26\u4e32",   # S_UTF8:     UTF-8 字符串
-    13: "\u6b22\u8fce\u4f7f\u7528\u56fd\u9645\u5316\u3002",   # S_WELCOME:  欢迎使用国际化。
-    14: "  [%s] %s\\n",           # F_RESULT: keep specifiers (\\n = backslash-n in C)
-    15: "\u8bed\u8a00: %s\\n",    # F_LANG:   语言: %s\n
-    16: "\u5df2\u8fd0\u884c\u6d4b\u8bd5: %d\\n",  # F_COUNT: 已运行测试: %d\n
-    17: "% hello world",          # F_PLAIN:  no change (no format specifiers)
+    11: "\u7b2c\u4e00\u884c\\n\u7b2c\u4e8c\u884c\\t\u7ed3\u675f",  # S_ESCAPE: 第一行\n第二行\t结束
+    12: "\u90e8\u5206\u6d4b\u8bd5\u5931\u8d25\u3002",         # S_SOME_FAIL:部分测试失败。
+    13: "UTF-8 \u5b57\u7b26\u4e32",   # S_UTF8:     UTF-8 字符串
+    14: "\u6b22\u8fce\u4f7f\u7528\u56fd\u9645\u5316\u3002",   # S_WELCOME:  欢迎使用国际化。
+    15: "  [%s] %s\\n",           # F_RESULT: keep specifiers (\\n = backslash-n in C)
+    16: "\u8bed\u8a00: %s\\n",    # F_LANG:   语言: %s\n
+    17: "\u5df2\u8fd0\u884c\u6d4b\u8bd5: %d\\n",  # F_COUNT: 已运行测试: %d\n
+    18: "% hello world",          # F_PLAIN:  no change (no format specifiers)
 }
 
 def repl2(m):
@@ -466,6 +467,118 @@ inject_cn
 
 # Restore backups
 rm -f .LANG.h.stage11.bak .LANG.c.stage11.bak LANG.cn.h.stage11.bak
+
+# ---------------------------------------------------------------------------
+# Stage 12 -- Codegen content verification
+#   Verify that the generated .LANG.c / .LANG.h contain expected patterns:
+#     a) "% " prefix on LA_F without format specifiers
+#     b) Unicode prefixes (u"", L"", U"", u8"") stripped in .LANG.c
+#     c) Deduplication: only ONE "OK" entry in .LANG.c
+#     d) Escape sequences preserved in .LANG.c
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 12] Codegen content verification ==="
+
+# a) "% " prefix on format strings without format specifiers
+check_contains  "12a: '% hello world' in .LANG.c"  '% hello world'   .LANG.c
+
+# b) Unicode prefixes stripped — stored as plain strings
+#    Source has u"UTF16", L"WIDE", U"UTF32", u8"UTF-8 String"
+#    .LANG.c should have the string without u/L/U/u8 prefix
+check_contains  "12b: UTF16 in .LANG.c"            '"UTF16"'         .LANG.c
+check_contains  "12b: WIDE in .LANG.c"             '"WIDE"'          .LANG.c
+check_contains  "12b: UTF32 in .LANG.c"            '"UTF32"'         .LANG.c
+check_contains  "12b: UTF-8 String in .LANG.c"     '"UTF-8 String"'  .LANG.c
+
+# c) Deduplication: only ONE occurrence of = "OK" in the string table
+OK_COUNT=$(grep -c '= "OK"' .LANG.c || true)
+if [ "$OK_COUNT" -eq 1 ]; then ok "12c: exactly one OK entry in .LANG.c"
+else fail "12c: expected 1 OK entry, got $OK_COUNT"; fi
+
+# d) Escape sequences preserved
+check_contains  "12d: escape seq in .LANG.c" 'Line1\\nLine2\\tEnd' .LANG.c
+
+# ---------------------------------------------------------------------------
+# Stage 13 -- --export + lang_load_fp
+#   a) Run --export → generates lang.en
+#   b) Verify lang.en exists and has expected line count
+#   c) Build hello-i18n with lang.en present → Test 4 (test_load_fp) runs
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 13] --export + lang_load_fp ==="
+
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --export) > /dev/null 2>&1
+check_file      "13a: lang.en generated"         "lang.en"
+check_contains  "13a: lang.en has OK"            "^OK$"  lang.en
+check_contains  "13a: lang.en has Hello"         "Hello, World!"  lang.en
+
+# Count non-comment lines (= number of exported strings)
+EN_LINES=$(grep -cv '^#' lang.en || true)
+if [ "$EN_LINES" -ge 18 ]; then ok "13b: lang.en has >= 18 strings ($EN_LINES)"
+else fail "13b: lang.en has $EN_LINES strings, expected >= 18"; fi
+
+echo "  Building: hello-i18n (with lang.en present) ..."
+make -s hello-i18n
+check "13c: hello-i18n builds"           test -x hello-i18n
+./hello-i18n > /tmp/i18n_fp_test.log 2>&1
+check "13c: hello-i18n exits 0"          ./hello-i18n
+check_contains  "13c: Test 4 runs"       "Test 4"         /tmp/i18n_fp_test.log
+check_not_found "13c: no FAIL in Test 4" "\[FAIL\].*file" /tmp/i18n_fp_test.log
+
+rm -f lang.en
+
+# ---------------------------------------------------------------------------
+# Stage 14 -- ndebug: disabled → remove → fully removed
+#   a) Delete W_READY → becomes disabled
+#   b) Gen with --ndebug → disabled entries still present (can re-appear)
+#   c) Mark disabled → remove, gen with --ndebug → fully removed
+#   d) Restore
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 14] ndebug disabled → remove → fully removed ==="
+cp hello.c hello.c.stage14.bak
+cp .LANG.h .LANG.h.stage14.bak
+cp .LANG.c .LANG.c.stage14.bak
+cp LANG.cn.h LANG.cn.h.stage14.bak
+
+# a) Delete W_READY → becomes disabled
+sed -i.tmp '/^#define W_READY/d' hello.c
+rm -f hello.c.tmp
+(cd "$I18N_DIR" && bash i18n.sh test --name hello) > /dev/null 2>&1
+
+check_contains  "14a: disabled in debug .LANG.h"   'disabled.*READY'  .LANG.h
+
+# b) Re-gen with --ndebug — disabled entries are kept (not removed)
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --ndebug) > /dev/null 2>&1
+
+check_contains  "14b: disabled kept in ndebug .LANG.h"   'disabled'  .LANG.h
+check_contains  "14b: READY kept in ndebug .LANG.c"      'READY'     .LANG.c
+check_not_found "14b: no _LA_ placeholder in .LANG.h"    '_LA_[0-9]' .LANG.h
+
+# c) Mark disabled → remove, gen with --ndebug → fully removed
+# Restore debug products first (ndebug may have compacted)
+(cd "$I18N_DIR" && bash i18n.sh test --name hello) > /dev/null 2>&1
+sed -i.tmp 's|/\* disabled "READY"|/* remove "READY"|' .LANG.h
+rm -f .LANG.h.tmp
+(cd "$I18N_DIR" && bash i18n.sh test --name hello) > /dev/null 2>&1
+# Now have _LA_5 placeholder; ndebug will remove it
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --ndebug) > /dev/null 2>&1
+
+check_not_found "14c: no _LA_ in ndebug .LANG.h"   '_LA_[0-9]' .LANG.h
+check_not_found "14c: no READY in ndebug .LANG.c"   'READY'      .LANG.c
+check_not_found "14c: no disabled entry in ndebug .LANG.h" 'disabled.*READY'  .LANG.h
+
+# d) Build still works
+echo "  Building: hello (ndebug, remove entry) ..."
+make -s hello
+check "14d: hello builds (ndebug)"    test -x hello
+check "14d: hello runs (ndebug)"      ./hello
+
+# e) Restore
+mv hello.c.stage14.bak hello.c
+mv .LANG.h.stage14.bak .LANG.h
+mv .LANG.c.stage14.bak .LANG.c
+mv LANG.cn.h.stage14.bak LANG.cn.h
 
 # ---------------------------------------------------------------------------
 # 汇总
