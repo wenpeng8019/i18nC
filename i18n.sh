@@ -280,6 +280,8 @@ if [ "$DEBUG_MODE" -eq 1 ]; then
     TEMP_FORMATS="$_debug_dir/formats.txt"
     TEMP_STRINGS="$_debug_dir/strings.txt"
     TEMP_MAP="$_debug_dir/map.txt"
+    TEMP_LINE_RAW="$_debug_dir/line_raw.txt"
+    TEMP_LINE_MAP="$_debug_dir/line_map.txt"
     TEMP_OLD_SID_MAP="$_debug_dir/old_sid_map.txt"
     TEMP_OLD_IMPORT_MAP="$_debug_dir/old_import_map.txt"
     TEMP_ENUM_DATA="$_debug_dir/enum_data.txt"
@@ -290,6 +292,8 @@ else
     TEMP_FORMATS=$(mktemp)
     TEMP_STRINGS=$(mktemp)
     TEMP_MAP=$(mktemp)
+    TEMP_LINE_RAW=$(mktemp)
+    TEMP_LINE_MAP=$(mktemp)
     TEMP_OLD_SID_MAP=$(mktemp)
     TEMP_OLD_IMPORT_MAP=$(mktemp)
     TEMP_ENUM_DATA=$(mktemp)
@@ -308,6 +312,7 @@ _fmt_ensure_prefix() {
 cleanup() {
     if [ "$DEBUG_MODE" -eq 0 ]; then
         rm -f "$TEMP_ALL" "$TEMP_WORDS" "$TEMP_FORMATS" "$TEMP_STRINGS" "$TEMP_MAP" \
+              "$TEMP_LINE_RAW" "$TEMP_LINE_MAP" \
               "$TEMP_OLD_SID_MAP" "$TEMP_OLD_IMPORT_MAP" "$TEMP_ENUM_DATA" \
               "${TEMP_EN_TRANS_MAP:-}"
     fi
@@ -478,24 +483,120 @@ cat > "$_marker_h" <<'MARKER_EOF'
 #define _I18N_SID_GET(_id, _sid, ...) _sid
 #define _I18N_SID(...) _I18N_SID_GET(__VA_ARGS__, 0, 0)
 #ifndef LA_W
-#define LA_W(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NW_END_
+#define LA_W(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NW_END_
 #endif
 #ifndef LA_S
-#define LA_S(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NS_END_
+#define LA_S(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NS_END_
 #endif
 #ifndef LA_F
-#define LA_F(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NF_END_
+#define LA_F(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NF_END_
 #endif
 #ifndef LA_CW
-#define LA_CW(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NW_END_
+#define LA_CW(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NW_END_
 #endif
 #ifndef LA_CS
-#define LA_CS(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NS_END_
+#define LA_CS(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NS_END_
 #endif
 #ifndef LA_CF
-#define LA_CF(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NF_END_
+#define LA_CF(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NF_END_
 #endif
 MARKER_EOF
+
+# 保存 awk 提取脚本到临时文件（避免重复）
+_awk_extract=$(mktemp /tmp/i18n_awk_XXXXXX)
+cat > "$_awk_extract" <<'AWK_EOF'
+{ content = content "\n" $0 }
+END {
+    pos = 1; clen = length(content)
+    while (pos <= clen) {
+        rest = substr(content, pos)
+        # 查找下一个 marker：_I18NW_、_I18NS_、_I18NF_
+        if (!match(rest, /_I18N[WSF]_/)) break
+        tp = substr(rest, RSTART + 5, 1)   # W, S, or F
+        pos = pos + RSTART + RLENGTH - 1
+
+        # 找对应的结束 marker
+        end_pat = "_I18N" tp "_END_"
+        rest2 = substr(content, pos)
+        if (!match(rest2, end_pat)) { pos++; continue }
+        fragment = substr(rest2, 1, RSTART - 1)
+        pos = pos + RSTART + RLENGTH - 1
+
+        # 在 fragment 中分离字符串部分、SID 和行号
+        # 格式: <strings> _I18NSID_ <sid> _I18NLINE_ <line>
+        esid = 0
+        eline = 0
+        str_frag = fragment
+        if (match(fragment, /_I18NSID_/)) {
+            str_frag = substr(fragment, 1, RSTART - 1)
+            _sf = substr(fragment, RSTART + RLENGTH)
+            if (match(_sf, /_I18NLINE_/)) {
+                _sid_part = substr(_sf, 1, RSTART - 1)
+                _line_part = substr(_sf, RSTART + RLENGTH)
+            } else {
+                _sid_part = _sf
+                _line_part = ""
+            }
+            gsub(/[ \t\n]/, "", _sid_part)
+            gsub(/[ \t\n]/, "", _line_part)
+            esid = _sid_part + 0
+            eline = _line_part + 0
+        }
+
+        # 从 str_frag 中提取并拼接所有字符串字面量（含宽字符串 L"..."）
+        result = ""
+        nlit = 0   # 统计字符串字面量个数（>1 = 宏拼接，如 PRIu64）
+        fpos = 1; flen = length(str_frag)
+        while (fpos <= flen) {
+            c1 = substr(str_frag, fpos, 1)
+            # 跳过 C 字符串前缀：L"..." / u"..." / U"..." / u8"..."
+            if (c1 ~ /[LuU]/ && fpos+1 <= flen) {
+                nxt = substr(str_frag, fpos+1, 1)
+                if (nxt == "\"") {
+                    fpos++; c1 = "\""
+                } else if (c1 == "u" && nxt == "8" && fpos+2 <= flen && substr(str_frag, fpos+2, 1) == "\"") {
+                    fpos += 2; c1 = "\""
+                }
+            }
+            if (c1 == "\"") {
+                nlit++
+                fpos++
+                while (fpos <= flen) {
+                    c2 = substr(str_frag, fpos, 1)
+                    if (c2 == "\\") {
+                        result = result substr(str_frag, fpos, 2)
+                        fpos += 2
+                    } else if (c2 == "\"") {
+                        fpos++; break
+                    } else {
+                        result = result c2; fpos++
+                    }
+                }
+            } else {
+                fpos++
+            }
+        }
+
+        # 多段字符串字面量（如 PRIu64）照常提取，回写时只更新枚举和 SID 参数
+
+        if (result != "") {
+            occ = 0
+            if (eline > 0) {
+                line_occ[eline]++
+                occ = line_occ[eline]
+            }
+            if (tp == "W") {
+                key = result; gsub(/^[ \t]+|[ \t]+$/, "", key)
+                print "W|" tolower(key) "|" key "|" base "|" esid "|" eline "|" src "|" occ
+            } else if (tp == "S") {
+                print "S|" tolower(result) "|" result "|" base "|" esid "|" eline "|" src "|" occ
+            } else {
+                print "F|" result "|" result "|" base "|" esid "|" eline "|" src "|" occ
+            }
+        }
+    }
+}
+AWK_EOF
 
 # 提取所有 LA_W/LA_S/LA_F
 # 处理 .c 和 .h 文件（.h 用 -x c 强制当 C 处理；cc -E 会递归展开所有 #include）
@@ -515,91 +616,99 @@ find "$SOURCE_DIR" \( -name "*.c" -o -name "*.h" \) \
     # shellcheck disable=SC2086
     if ! $_cc_flags $_xflag -E -P -include "$_marker_h" "$file" \
             2>"$_cc_err_tmp" | \
-    awk -v base="$base" '
-    { content = content "\n" $0 }
-    END {
-        pos = 1; clen = length(content)
-        while (pos <= clen) {
-            rest = substr(content, pos)
-            # 查找下一个 marker：_I18NW_、_I18NS_、_I18NF_
-            if (!match(rest, /_I18N[WSF]_/)) break
-            tp = substr(rest, RSTART + 5, 1)   # W, S, or F
-            pos = pos + RSTART + RLENGTH - 1
-
-            # 找对应的结束 marker
-            end_pat = "_I18N" tp "_END_"
-            rest2 = substr(content, pos)
-            if (!match(rest2, end_pat)) { pos++; continue }
-            fragment = substr(rest2, 1, RSTART - 1)
-            pos = pos + RSTART + RLENGTH - 1
-
-            # 在 fragment 中分离字符串部分和 SID 部分
-            # 格式: <strings> _I18NSID_ <sid> （SID 由 marker 宏从源码透传）
-            esid = 0
-            str_frag = fragment
-            if (match(fragment, /_I18NSID_/)) {
-                str_frag = substr(fragment, 1, RSTART - 1)
-                _sf = substr(fragment, RSTART + RLENGTH)
-                gsub(/[ \t\n]/, "", _sf)
-                esid = _sf + 0
-            }
-
-            # 从 str_frag 中提取并拼接所有字符串字面量（含宽字符串 L"..."）
-            result = ""
-            nlit = 0   # 统计字符串字面量个数（>1 = 宏拼接，如 PRIu64）
-            fpos = 1; flen = length(str_frag)
-            while (fpos <= flen) {
-                c1 = substr(str_frag, fpos, 1)
-                # 跳过 C 字符串前缀：L"..." / u"..." / U"..." / u8"..."
-                if (c1 ~ /[LuU]/ && fpos+1 <= flen) {
-                    nxt = substr(str_frag, fpos+1, 1)
-                    if (nxt == "\"") {
-                        fpos++; c1 = "\""
-                    } else if (c1 == "u" && nxt == "8" && fpos+2 <= flen && substr(str_frag, fpos+2, 1) == "\"") {
-                        fpos += 2; c1 = "\""
-                    }
-                }
-                if (c1 == "\"") {
-                    nlit++
-                    fpos++
-                    while (fpos <= flen) {
-                        c2 = substr(str_frag, fpos, 1)
-                        if (c2 == "\\") {
-                            result = result substr(str_frag, fpos, 2)
-                            fpos += 2
-                        } else if (c2 == "\"") {
-                            fpos++; break
-                        } else {
-                            result = result c2; fpos++
-                        }
-                    }
-                } else {
-                    fpos++
-                }
-            }
-
-            # 多段字符串字面量 = 含宏拼接（如 PRIu64），无法通过原始源码追踪 SID，跳过
-            if (nlit > 1) { result = "" }
-
-            if (result != "") {
-                if (tp == "W") {
-                    key = result; gsub(/^[ \t]+|[ \t]+$/, "", key)
-                    print "W|" tolower(key) "|" key "|" base "|" esid
-                } else if (tp == "S") {
-                    print "S|" tolower(result) "|" result "|" base "|" esid
-                } else {
-                    print "F|" result "|" result "|" base "|" esid
-                }
-            }
-        }
-    }
-    '; then
+    awk -v base="$base" -v src="$file" -f "$_awk_extract"; then
         echo "Warning: preprocessing failed for $file" >&2
         [ "$DEBUG_MODE" -eq 1 ] && cat "$_cc_err_tmp" >&2
     fi
     rm -f "$_cc_err_tmp"
+
+    # Phase 0.5: 处理 #define 中的 LA_ 调用
+    # 支持多行续行（以 \ 结尾的行会与后续行合并）
+    # 用 awk 合并续行后检测是否包含 LA_C?[WSF]
+    _probe_tmp=$(mktemp /tmp/i18n_probe_XXXXXX.c)
+    _abs_file=$(cd "$(dirname "$file")" && pwd)/$(basename "$file")
+    # 转义 C 字符串特殊字符：\ → \\, " → \"
+    _escaped_file=$(printf '%s' "$_abs_file" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    echo "#include \"$_escaped_file\"" > "$_probe_tmp"
+    
+    awk -v srcfile="$file" '
+    BEGIN { in_define = 0; start_line = 0; content = "" }
+    {
+        # 检查是否是 #define 开头
+        if (/^[[:space:]]*#[[:space:]]*define[[:space:]]/) {
+            in_define = 1
+            start_line = NR
+            content = $0
+        } else if (in_define) {
+            content = content " " $0
+        }
+        
+        # 检查是否续行（以 \ 结尾）
+        if (in_define && /\\[[:space:]]*$/) {
+            # 去掉行尾的 \ 和空白
+            sub(/\\[[:space:]]*$/, "", content)
+            next
+        }
+        
+        # 续行结束或非续行，处理累积的内容
+        if (in_define) {
+            # 检查合并后的内容是否包含 LA_C?[WSF](
+            if (match(content, /LA_C?[WSF]\(/)) {
+                # 从 content 中提取所有 LA_C?[WSF](...) 调用
+                line = content
+                probe_num = 0
+                pos = 1
+                len = length(line)
+                while (pos <= len) {
+                    rest_str = substr(line, pos)
+                    if (!match(rest_str, /LA_C?[WSF]\(/)) break
+                    start = pos + RSTART - 1
+                    # 找匹配的右括号
+                    depth = 1
+                    ppos = start + RLENGTH
+                    while (ppos <= len && depth > 0) {
+                        c = substr(line, ppos, 1)
+                        if (c == "(") depth++
+                        else if (c == ")") depth--
+                        ppos++
+                    }
+                    if (depth == 0) {
+                        call = substr(line, start, ppos - start)
+                        probe_num++
+                        print "#line " start_line " \"" srcfile "\""
+                        print "static inline void __i18n_probe_" start_line "_" probe_num "() { " call "; }"
+                    }
+                    pos = ppos
+                }
+            }
+            in_define = 0
+            content = ""
+        }
+    }
+    ' "$file" >> "$_probe_tmp"
+
+    # 检查是否生成了探测代码（超过1行=有内容）
+    if [ "$(wc -l < "$_probe_tmp")" -gt 1 ]; then
+        # 用相同编译参数预处理探测文件
+        _cc_err_tmp2=$(mktemp)
+        # shellcheck disable=SC2086
+        if $_cc_flags -x c -E -P -include "$_marker_h" "$_probe_tmp" 2>"$_cc_err_tmp2" | \
+            awk -v base="$base" -v src="$file" -f "$_awk_extract"; then
+            :
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "Warning: probe preprocessing failed for $file" >&2
+            [ "$DEBUG_MODE" -eq 1 ] && cat "$_cc_err_tmp2" >&2
+        fi
+        rm -f "$_cc_err_tmp2"
+    fi
+    rm -f "$_probe_tmp"
 done > "$TEMP_ALL"
-rm -f "$_marker_h"
+rm -f "$_marker_h" "$_awk_extract"
+
+# 记录每个宏调用位置（file|line|occ|type|key|sid）供回写使用
+awk -F'|' 'NF >= 8 && $6 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+$/ {
+    print $7 "|" $6 "|" $8 "|" $1 "|" $2 "|" ($5+0)
+}' "$TEMP_ALL" > "$TEMP_LINE_RAW"
 
 # 分类并聚合文件名（去重 key，合并文件列表，保留首个非零 SID）
 grep "^W|" "$TEMP_ALL" | awk -F'|' '{
@@ -795,6 +904,21 @@ if [ "$format_count" -gt 0 ]; then
         sid=$((sid + 1))
     done < "$TEMP_FORMATS"
 fi
+
+# 用 TYPE|key 映射更新每个源码位置，得到 file|line|occ|id_name|sid
+awk -F'|' '
+    FNR==NR {
+        map_id[$1 SUBSEP $2] = $3
+        map_sid[$1 SUBSEP $2] = $4
+        next
+    }
+    {
+        k = $4 SUBSEP $5
+        if (k in map_id) {
+            print $1 "|" $2 "|" $3 "|" map_id[k] "|" map_sid[k]
+        }
+    }
+' "$TEMP_MAP" "$TEMP_LINE_RAW" > "$TEMP_LINE_MAP"
 
 # ======================================================================
 # Phase 1b: 收集禁用条目（旧 .LANG.c 中存在但本次未扫描到的）
@@ -1349,17 +1473,21 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
     
     # 使用 awk 扫描替换 LA_W/S/F 中的 ID
     _i18n_tmp=$(mktemp)
-    awk -v mapfile="$TEMP_MAP" '
+    awk -v mapfile="$TEMP_LINE_MAP" -v curfile="$file" '
         BEGIN {
             while ((getline ln < mapfile) > 0) {
                 n = split(ln, a, "|");
-                if (n >= 3) mapn[a[1] SUBSEP a[2]] = a[3]
-                if (n >= 4) mapsid[a[1] SUBSEP a[2]] = a[4]
+                if (n >= 5) {
+                    k = a[1] SUBSEP a[2] SUBSEP a[3]
+                    mapn[k] = a[4]
+                    mapsid[k] = a[5]
+                }
             }
             close(mapfile)
         }
         {
             line = $0; result = ""; i = 1; L = length(line)
+            occ = 0
             while (i <= L) {
                 if (substr(line,i,3) == "LA_") {
                     t = substr(line,i+3,1)
@@ -1376,6 +1504,15 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                         j = i+skip
                         while (j <= L && substr(line,j,1) ~ /[ \t]/) j++
                         if (j <= L && substr(line,j,1) == "(") {
+                            occ++
+                            mapk = curfile SUBSEP FNR SUBSEP occ
+                            new_id = mapn[mapk]
+                            new_sid = mapsid[mapk]
+                            if (new_id == "") {
+                                result = result substr(line,i,1)
+                                i++
+                                continue
+                            }
                             j++
                             while (j <= L && substr(line,j,1) ~ /[ \t]/) j++
                             # Skip optional unicode string prefix: u" L" U" u8"
@@ -1384,6 +1521,10 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                                 if (ch == "u" && substr(line,j+1,1) == "8" && substr(line,j+2,1) == "\"") j += 2
                                 else if (substr(line,j+1,1) == "\"") j += 1
                             }
+                            # TODO: 当前只支持第一个参数以字符串字面量开头的情况。
+                            # 如果第一个参数是带括号的宏调用（如 LA_F(CONCAT("a","b"), ID, SID)），
+                            # 需要改用括号深度+字符串追踪来跳过，而不是假设以 " 开头。
+                            # 目前这种用法会被跳过不处理。
                             if (j <= L && substr(line,j,1) == "\"") {
                                 sv = ""; k = j+1
                                 while (k <= L) {
@@ -1400,69 +1541,90 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                                         while (k <= L && substr(line,k,1) ~ /[ \t]/) k++
                                         id0 = k
                                         while (k <= L && substr(line,k,1) ~ /[A-Za-z0-9_]/) k++
-                                        kv = sv
-                                        if (t == "W") { gsub(/^[ \t]+|[ \t]+$/, "", kv); kv = tolower(kv) }
-                                        else if (t == "S") kv = tolower(kv)
-                                        new_id  = mapn[t SUBSEP kv]
-                                        new_sid = mapsid[t SUBSEP kv]
-                                        if (new_id != "") {
-                                            result = result substr(line,i,eq-i+1) substr(line,eq+1,id0-eq-1) new_id
-                                            if (new_sid != "") {
-                                                result = result ", " new_sid
-                                                # skip existing numeric 3rd arg if present
-                                                k2 = k
-                                                while (k2 <= L && substr(line,k2,1) ~ /[ \t]/) k2++
-                                                if (k2 <= L && substr(line,k2,1) == ",") {
-                                                    k3 = k2+1
-                                                    while (k3 <= L && substr(line,k3,1) ~ /[ \t]/) k3++
-                                                    if (k3 <= L && substr(line,k3,1) ~ /[0-9]/) {
-                                                        while (k3 <= L && substr(line,k3,1) ~ /[0-9]/) k3++
-                                                        k = k3
-                                                    }
+                                        if (new_id == "") {
+                                            result = result substr(line,i,1)
+                                            i++
+                                            continue
+                                        }
+                                        result = result substr(line,i,id0-i) new_id
+                                        if (new_sid != "") {
+                                            result = result ", " new_sid
+                                            # skip existing numeric 3rd arg if present
+                                            k2 = k
+                                            while (k2 <= L && substr(line,k2,1) ~ /[ \t]/) k2++
+                                            if (k2 <= L && substr(line,k2,1) == ",") {
+                                                k3 = k2+1
+                                                while (k3 <= L && substr(line,k3,1) ~ /[ \t]/) k3++
+                                                if (k3 <= L && substr(line,k3,1) ~ /[0-9]/) {
+                                                    while (k3 <= L && substr(line,k3,1) ~ /[0-9]/) k3++
+                                                    k = k3
                                                 }
                                             }
-                                            i = k; continue
+                                        }
+                                        i = k; continue
+                                    }
+
+                                    # 处理多字面量首参数: "..." PRIu64 "..." ... , id, sid
+                                    kk = k
+                                    ok = 0
+                                    while (kk <= L) {
+                                        while (kk <= L && substr(line,kk,1) ~ /[ \t]/) kk++
+                                        if (kk <= L && substr(line,kk,1) == ",") { ok = 1; break }
+
+                                        # 跳过中间宏名（如 PRIu64）
+                                        if (kk <= L && substr(line,kk,1) ~ /[A-Za-z_]/) {
+                                            while (kk <= L && substr(line,kk,1) ~ /[A-Za-z0-9_]/) kk++
+                                            while (kk <= L && substr(line,kk,1) ~ /[ \t]/) kk++
+                                            continue  # 回到循环顶部重新检查逗号
+                                        }
+
+                                        # 跳过可选字符串前缀
+                                        cpk = substr(line,kk,1)
+                                        if ((cpk == "u" || cpk == "L" || cpk == "U") && kk+1 <= L) {
+                                            if (cpk == "u" && substr(line,kk+1,1) == "8" && kk+2 <= L && substr(line,kk+2,1) == "\"") kk += 2
+                                            else if (substr(line,kk+1,1) == "\"") kk += 1
+                                        }
+
+                                        # 读取下一个字符串片段
+                                        if (kk <= L && substr(line,kk,1) == "\"") {
+                                            kk++
+                                            while (kk <= L) {
+                                                cc = substr(line,kk,1)
+                                                if (cc == "\\") kk += 2
+                                                else if (cc == "\"") { kk++; break }
+                                                else kk++
+                                            }
+                                        } else {
+                                            break
                                         }
                                     }
-                                    # String literal concatenation (e.g. "..." PRIu64 "...")
-                                    # — cannot track SID through raw source; force-reset to 0, 0
-                                    else if (k <= L && substr(line,k,1) ~ /[A-Za-z_]/) {
-                                        _cdone = 0
-                                        _ck = k
-                                        while (!_cdone && _ck <= L) {
-                                            while (_ck <= L && substr(line,_ck,1) ~ /[A-Za-z0-9_]/) _ck++
-                                            while (_ck <= L && substr(line,_ck,1) ~ /[ \t]/) _ck++
-                                            if (_ck <= L && substr(line,_ck,1) == "\"") {
-                                                _ck++
-                                                while (_ck <= L) {
-                                                    _cc = substr(line,_ck,1)
-                                                    if (_cc == "\\") _ck += 2
-                                                    else if (_cc == "\"") { _ck++; break }
-                                                    else _ck++
-                                                }
-                                                while (_ck <= L && substr(line,_ck,1) ~ /[ \t]/) _ck++
-                                                if (_ck <= L && substr(line,_ck,1) == ",") _cdone = 1
-                                            } else break
+
+                                    if (ok == 1) {
+                                        k = kk + 1
+                                        while (k <= L && substr(line,k,1) ~ /[ \t]/) k++
+                                        id0 = k
+                                        while (k <= L && substr(line,k,1) ~ /[A-Za-z0-9_]/) k++
+                                        if (new_id == "") {
+                                            result = result substr(line,i,1)
+                                            i++
+                                            continue
                                         }
-                                        if (_cdone) {
-                                            _ck++
-                                            while (_ck <= L && substr(line,_ck,1) ~ /[ \t]/) _ck++
-                                            _cid0 = _ck
-                                            while (_ck <= L && substr(line,_ck,1) ~ /[A-Za-z0-9_]/) _ck++
-                                            result = result substr(line, i, _cid0 - i) "0"
-                                            _ck2 = _ck
-                                            while (_ck2 <= L && substr(line,_ck2,1) ~ /[ \t]/) _ck2++
-                                            if (_ck2 <= L && substr(line,_ck2,1) == ",") {
-                                                _ck3 = _ck2 + 1
-                                                while (_ck3 <= L && substr(line,_ck3,1) ~ /[ \t]/) _ck3++
-                                                if (_ck3 <= L && substr(line,_ck3,1) ~ /[0-9]/) {
-                                                    while (_ck3 <= L && substr(line,_ck3,1) ~ /[0-9]/) _ck3++
-                                                    result = result ", 0"
-                                                    _ck = _ck3
+                                        result = result substr(line,i,id0-i) new_id
+                                        if (new_sid != "") {
+                                            result = result ", " new_sid
+                                            # skip existing numeric 3rd arg if present
+                                            k2 = k
+                                            while (k2 <= L && substr(line,k2,1) ~ /[ \t]/) k2++
+                                            if (k2 <= L && substr(line,k2,1) == ",") {
+                                                k3 = k2+1
+                                                while (k3 <= L && substr(line,k3,1) ~ /[ \t]/) k3++
+                                                if (k3 <= L && substr(line,k3,1) ~ /[0-9]/) {
+                                                    while (k3 <= L && substr(line,k3,1) ~ /[0-9]/) k3++
+                                                    k = k3
                                                 }
                                             }
-                                            i = _ck; continue
                                         }
+                                        i = k; continue
                                     }
                                 }
                             }

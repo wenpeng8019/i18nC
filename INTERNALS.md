@@ -6,10 +6,16 @@
 
 ## 总体流程
 
-提取管线分七个阶段：
+提取管线分八个阶段：
 
 ```
 源文件 .c / .h
+        │
+        ▼
+[0] 初始化         →  读取 .i18n（SID_NEXT, LA_NAME）
+        │
+        ▼
+[0.5] #define 探测 →  扫描 #define 中的 LA_，生成虚拟探测代码
         │
         ▼
 [1] Marker 注入    →  临时 _marker_h   （将 LA_W/S/F 重定义为含 SID 的哨兵标记）
@@ -18,13 +24,13 @@
 [2] cc -E 预处理   →  宏展开后的文本   （所有 #include 递归展开）
         │
         ▼
-[3] awk 字符串解析 →  W|key|str|file|sid  （字符串 + SID 统一从预处理输出提取）
+[3] awk 字符串解析 →  W|key|str|file|sid|line  （字符串 + SID + 行号）
         │
         ▼
-[4] 去重 + 排序    →  TEMP_WORDS / TEMP_FORMATS / TEMP_STRINGS （携带 SID）
-        │
+[4] 去重 + 排序    →  TEMP_WORDS / TEMP_FORMATS / TEMP_STRINGS（携带 SID）
+        │              TEMP_LINE_MAP（每个位置的 file|line|occ）
         ▼
-[5] SID 分配 + 代码生成 →  .LANG.h  /  .LANG.c（含 SID）/  lang.en
+[5] SID 分配 + 代码生成 →  .LANG.h  /  .LANG.c（含 SID）
         │
         ▼
 [6] 源码回写       →  LA_W("str", 0) → LA_W("str", LA_W3, 5)
@@ -35,30 +41,107 @@
 
 ---
 
+## 阶段 0.5 — #define 探测
+
+### 问题背景
+
+C 预处理器只在宏**调用点**展开，`#define` 定义体对预处理器是"透明"的：
+
+```c
+4:  #define LOG_SES(ID) LA_F("sid=%" PRIu64 "\n", 0, 0), ID
+```
+
+直接 `cc -E` 时，第 4 行的 `LA_F` 不会被展开，TEMP_LINE_MAP 没有该行记录。
+
+### 解决方案
+
+扫描源文件中 `#define` 行内的 `LA_C?[WSF](...)` 调用，
+生成虚拟探测代码，强制预处理器展开它们。
+
+#### Step 1: 扫描并合并续行
+
+用 awk 状态机处理以 `\` 结尾的续行：
+
+```c
+// 会被正确识别为一个完整的 #define
+#define F_MULTILINE \
+    LA_F("multiline message", LA_F20, 20)
+```
+
+状态机逻辑：
+- 遇到 `#define` 开头行，进入"收集"模式
+- 行尾有 `\` 则继续收集下一行
+- 行尾无 `\` 则结束收集，合并为单行后检测 `LA_C?[WSF]\(`
+
+#### Step 2: 提取 LA_ 调用
+
+对每个匹配行，用括号深度计数提取完整的 `LA_*(...)` 调用：
+
+```
+行 4: LA_F("sid=%" PRIu64 "\n", 0, 0)
+```
+
+#### Step 3: 生成虚拟探测代码
+
+为每个调用生成一个内联函数，用 `#line` 指令设置正确行号：
+
+```c
+#include "/abs/path/to/example.c"
+#line 4 "example.c"
+static inline void __i18n_probe_4_1() { LA_F("sid=%" PRIu64 "\n", 0, 0); }
+```
+
+关键点：
+- `#line 4` 使后续的 `__LINE__` 返回 4（原始定义行号）
+- `#include` 原文件以继承编译环境和宏定义
+- 只用于预处理，不要求可编译
+
+### 路径转义
+
+`#include` 路径中的特殊字符需要转义：
+- `\` → `\\`（Windows 路径分隔符）
+- `"` → `\"`（极罕见但存在）
+
+### 效果
+
+1. `#define` 中的 LA_ 也能获得正确的行号记录
+2. Phase 6 回写时能命中 `#define` 行
+3. 首次运行 SID=0 的调用也能正常工作
+
+---
+
 ## 阶段 1 — Marker 注入
 
 核心思路：**不自己解析 C 语法，而是让 C 预处理器代劳**，再从输出中识别已知哨兵标记。
 
 临时头文件（`_marker_h`）将宏重定义为在字符串两侧插入哨兵标记，
-**并通过 `_I18NSID_` 分隔符将 SID 嵌入预处理输出**：
+**同时嵌入 SID 和行号信息**：
 
 ```c
 // 通过 cc -E -P -include _marker_h source.c 注入
 
+#define _I18N_SID(...) __VA_ARGS__
+
 #ifndef LA_W
-#define LA_W(WD, ID, SID)      _I18NW_  WD  _I18NSID_ SID  _I18NW_END_
+#define LA_W(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NW_END_
 #endif
 #ifndef LA_S
-#define LA_S(STR, ID, SID)     _I18NS_  STR _I18NSID_ SID  _I18NS_END_
+#define LA_S(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NS_END_
 #endif
 #ifndef LA_F
-#define LA_F(FMT, ID, SID, ...) _I18NF_ FMT _I18NSID_ SID  _I18NF_END_
+#define LA_F(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NF_END_
 #endif
 ```
 
-SID 作为纯数字常量，在 `cc -E` 展开后原样保留在输出中，
-使提取器能从同一条预处理输出中同时获得字符串内容和其 SID——
-不再需要单独扫描原始源码来提取 SID（旧方案的一致性问题根源）。
+**关键设计**：
+- `_I18NSID_` 分隔符后嵌入枚举名和 SID 参数
+- `_I18NLINE_` 分隔符后嵌入 `__LINE__`（宏展开时的行号）
+- `_I18N_SID(...)` 辅助宏用于原样传递可变参数
+
+SID 和行号在 `cc -E` 展开后原样保留在输出中，使提取器能从同一条预处理输出中同时获得：
+1. 字符串内容
+2. 现有 SID（用于跨版本跟踪）
+3. 源码行号（用于回写定位）
 
 这样做的好处：
 - 宏参数中的**相邻字符串拼接**由预处理器自动处理
@@ -82,22 +165,26 @@ SID 作为纯数字常量，在 `cc -E` 展开后原样保留在输出中，
 对于如下源码片段：
 
 ```c
-printf(LA_S("Connection to " SERVER_NAME " failed", LA_S0), ...);
+printf(LA_S("Connection to " SERVER_NAME " failed", LA_S0, 12), ...);
 ```
 
 经 `cc -E -P` 处理后：
 
 ```
-printf( _I18NS_  "Connection to " "myserver" " failed"  _I18NSID_ 12  _I18NS_END_ , ...);
+printf( _I18NS_  "Connection to " "myserver" " failed"  _I18NSID_ LA_S0, 12 _I18NLINE_ 5 _I18NS_END_ , ...);
 ```
 
 预处理器完成了：
 - 将 `SERVER_NAME` 替换为其定义
 - 保留相邻字符串字面量为独立 token（尚未合并）
-- 将 SID（第三参数 `12`）展开为 `_I18NSID_ 12`，嵌入输出
+- `_I18NSID_` 后嵌入枚举名和 SID（`LA_S0, 12`）
+- `_I18NLINE_` 后嵌入行号（`5`）
 
-哨兵 `_I18NS_` 标记区域起点，`_I18NSID_` 分隔字符串与 SID，
-`_I18NS_END_` 标记区域终点。
+哨兵分隔符：
+- `_I18NS_` 标记区域起点
+- `_I18NSID_` 分隔字符串与参数
+- `_I18NLINE_` 分隔参数与行号
+- `_I18NS_END_` 标记区域终点
 
 ---
 
@@ -113,7 +200,8 @@ awk 提取器将整个预处理输出作为一个文本块处理。
         ▼
 进入"收集"模式
 提取 _I18N[WSF]_ ... _I18NSID_ 之间的内容作为字符串片段
-提取 _I18NSID_ ... _I18N[WSF]_END_ 之间的内容作为 SID
+提取 _I18NSID_ ... _I18NLINE_ 之间的内容取末尾数字作为 SID
+提取 _I18NLINE_ ... _I18N[WSF]_END_ 之间的内容作为行号
         │
         ▼
 对字符串片段：
@@ -124,7 +212,7 @@ awk 提取器将整个预处理输出作为一个文本块处理。
         │
         ▼
 nlit > 1（宏拼接如 PRIu64）→ 跳过该条目
-nlit = 1 → 输出：TYPE|key|str|源文件名|sid
+nlit = 1 → 输出：TYPE|key|str|源文件名|sid|line|occ
 ```
 
 **字符串前缀处理：**  
@@ -398,3 +486,126 @@ i18n/debug/
 ```
 
 当提取结果不符合预期时，加 `--debug` 参数运行即可检查各阶段中间结果。
+
+---
+
+## 特殊情况处理
+
+以下场景需要额外处理逻辑，已在提取器中实现。
+
+### 1. 多行 `#define` 续行符
+
+C 预处理器支持用 `\` 将长行分割为多行：
+
+```c
+#define F_MULTILINE \
+    LA_F("multiline message", LA_F20, 20)
+```
+
+**处理方式**：阶段 0.5 使用 awk 状态机，在扫描 `#define` 时将续行合并为完整行后再匹配 `LA_C?[WSF]\(`。
+
+### 2. 路径特殊字符转义
+
+阶段 0.5 生成的虚拟探测代码包含 `#include "绝对路径"` 指令，路径中可能包含 C 字符串的特殊字符：
+
+| 字符 | 转义 | 说明 |
+|-----|-----|-----|
+| `\` | `\\` | Windows 路径分隔符 |
+| `"` | `\"` | 极罕见，但需要处理 |
+
+**处理方式**：在生成 `#include` 前对路径进行转义（bash 用 `sed`，PowerShell 用 `.Replace()`）。
+
+### 3. 字符串字面量拼接
+
+C 允许相邻字符串字面量自动拼接：
+
+```c
+LA_S("hello " "world", S_TEST, 1);  // 等价于 "hello world"
+```
+
+**处理方式**：阶段 3 的 awk 解析器在同一 Marker 区域内收集所有引号片段并拼接。
+
+### 4. 宽字符前缀
+
+支持 C11 字符前缀：
+
+```c
+LA_W(L"宽字符", W_WIDE, 1);
+LA_W(u"UTF-16", W_UTF16, 2);
+LA_W(U"UTF-32", W_UTF32, 3);
+LA_W(u8"UTF-8", W_UTF8, 4);
+```
+
+**处理方式**：阶段 3 解析器在遇到 `L`、`u`、`U`、`u8` 后跟 `"` 时跳过前缀，只提取字符串内容。
+
+### 5. 多段宏拼接字符串（PRIu64）
+
+涉及 `<inttypes.h>` 格式宏的字符串：
+
+```c
+LA_F("id=%" PRIu64 "\n", 0, 0);  // PRIu64 展开为 "llu"
+```
+
+预处理后变为多个字面量片段（`nlit > 1`），无法统一追踪。
+
+**处理方式**：
+- 阶段 3 检测 `nlit > 1` 时跳过该条目
+- 阶段 6 回写时将 ID 和 SID 重置为 `0, 0`，确保运行时直接使用字面量
+
+### 6. 同行多个 LA_ 调用
+
+单行可能有多个调用：
+
+```c
+printf("%s %s", LA_W("A", W_A, 1), LA_W("B", W_B, 2));
+```
+
+**处理方式**：用 `occ`（occurrence）字段记录同一行的第几次出现，回写时按 `(file, line, occ)` 三元组精确匹配。
+
+---
+
+## 已知限制
+
+以下场景当前无法自动处理，需要应用层避免使用。
+
+### 1. 间接宏别名
+
+当 `LA_W/S/F` 通过宏别名间接调用时，阶段 0.5 无法识别：
+
+```c
+// ❌ 不支持：无法被提取
+#define MSG LA_W
+#define GREETING MSG("Hello", 0, 0)
+```
+
+`MSG("Hello", ...)` 不匹配正则 `LA_C?[WSF]\(`，因此不会被检测。
+
+**规避方式**：直接使用 `LA_W/S/F`，不要定义别名。
+
+### 2. `#if 0` 注释块
+
+被 `#if 0` 或未满足的条件编译包裹的代码不会被提取：
+
+```c
+#if 0
+// ❌ 不会被提取（预期行为）
+LA_W("disabled", W_DISABLED, 1);
+#endif
+```
+
+这是**预期行为**——死代码中的字符串不应进入国际化流程。
+如果确实需要保留，请移除 `#if 0` 或改用注释。
+
+### 3. 嵌套宏作为 LA_ 的第一参数
+
+当字符串参数本身是宏调用时：
+
+```c
+#define MSG "Hello"
+// ⚠️ 可能有问题
+#define GREETING LA_W(MSG, W_GREETING, 1)
+```
+
+**当前行为**：`MSG` 会被预处理器展开，实际字符串 `"Hello"` 会被正确提取，但取决于 `MSG` 的定义是否可见。
+
+**建议**：优先使用字符串字面量作为第一参数。

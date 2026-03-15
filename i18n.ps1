@@ -157,6 +157,8 @@ if ($DebugMode) {
     $TempFormats = Join-Path $DebugDir "formats.txt"
     $TempStrings = Join-Path $DebugDir "strings.txt"
     $TempMap     = Join-Path $DebugDir "map.txt"
+    $TempLineRaw = Join-Path $DebugDir "line_raw.txt"
+    $TempLineMap = Join-Path $DebugDir "line_map.txt"
     Write-Host "Debug mode: temp files saved to $DebugDir\"
 } else {
     $TempAll     = [System.IO.Path]::GetTempFileName()
@@ -164,6 +166,8 @@ if ($DebugMode) {
     $TempFormats = [System.IO.Path]::GetTempFileName()
     $TempStrings = [System.IO.Path]::GetTempFileName()
     $TempMap     = [System.IO.Path]::GetTempFileName()
+    $TempLineRaw = [System.IO.Path]::GetTempFileName()
+    $TempLineMap = [System.IO.Path]::GetTempFileName()
 }
 
 # 临时 marker 头文件路径（脚本结束时显式清理）
@@ -350,22 +354,22 @@ $markerContent = @'
 #define _I18N_SID_GET(_id, _sid, ...) _sid
 #define _I18N_SID(...) _I18N_SID_GET(__VA_ARGS__, 0, 0)
 #ifndef LA_W
-#define LA_W(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NW_END_
+#define LA_W(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NW_END_
 #endif
 #ifndef LA_S
-#define LA_S(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NS_END_
+#define LA_S(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NS_END_
 #endif
 #ifndef LA_F
-#define LA_F(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NF_END_
+#define LA_F(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NF_END_
 #endif
 #ifndef LA_CW
-#define LA_CW(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NW_END_
+#define LA_CW(WD, ...) _I18NW_ WD _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NW_END_
 #endif
 #ifndef LA_CS
-#define LA_CS(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NS_END_
+#define LA_CS(STR, ...) _I18NS_ STR _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NS_END_
 #endif
 #ifndef LA_CF
-#define LA_CF(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NF_END_
+#define LA_CF(FMT, ...) _I18NF_ FMT _I18NSID_ _I18N_SID(__VA_ARGS__) _I18NLINE_ __LINE__ _I18NF_END_
 #endif
 '@
 [System.IO.File]::WriteAllText($TempMarkerH, $markerContent, [System.Text.UTF8Encoding]::new($false))
@@ -414,9 +418,10 @@ function Invoke-Preprocessor {
 # ============================================================================
 
 function Extract-Strings {
-    param([string]$Content, [string]$Base)
+    param([string]$Content, [string]$Base, [string]$SourcePath)
 
     $results = [System.Collections.Generic.List[string]]::new()
+    $lineOcc = @{}
     $pos = 0
     $len = $Content.Length
 
@@ -437,14 +442,23 @@ function Extract-Strings {
         $fragment = $Content.Substring($pos, $endIdx - $pos)
         $pos      = $endIdx + $endPat.Length
 
-        # 在 fragment 中分离字符串部分和 SID 部分
-        # 格式: <strings> _I18NSID_ <sid> （SID 由 marker 宏从源码透传）
+        # 在 fragment 中分离字符串部分、SID 和行号
+        # 格式: <strings> _I18NSID_ <sid> _I18NLINE_ <line>
         $esid = 0
+        $eline = 0
         $sidMarkerIdx = $fragment.IndexOf('_I18NSID_')
         if ($sidMarkerIdx -ge 0) {
-            $sidStr = $fragment.Substring($sidMarkerIdx + 9).Trim()
-            if ($sidStr -match '^\d+') { $esid = [int]$Matches[0] }
+            $sidStr = $fragment.Substring($sidMarkerIdx + 9)
             $fragment = $fragment.Substring(0, $sidMarkerIdx)
+            $lineMarkerIdx = $sidStr.IndexOf('_I18NLINE_')
+            if ($lineMarkerIdx -ge 0) {
+                $lineStr = $sidStr.Substring($lineMarkerIdx + 10).Trim()
+                $sidStr = $sidStr.Substring(0, $lineMarkerIdx).Trim()
+                if ($lineStr -match '^\d+') { $eline = [int]$Matches[0] }
+            } else {
+                $sidStr = $sidStr.Trim()
+            }
+            if ($sidStr -match '^\d+') { $esid = [int]$Matches[0] }
         }
 
         # 提取并拼接 fragment 中所有字符串字面量
@@ -491,20 +505,25 @@ function Extract-Strings {
             }
         }
 
-        # 多段字符串字面量 = 含宏拼接（如 PRIu64），无法通过原始源码追踪 SID，跳过
-        if ($nlit -gt 1) { $sb.Clear(); $str = '' } else { $str = $sb.ToString() }
+        $str = $sb.ToString()
         if ($str -ne '') {
+            $occ = 0
+            if ($eline -gt 0) {
+                if (-not $lineOcc.ContainsKey($eline)) { $lineOcc[$eline] = 0 }
+                $lineOcc[$eline] = [int]$lineOcc[$eline] + 1
+                $occ = [int]$lineOcc[$eline]
+            }
             switch ($tp) {
                 'W' {
                     $key = $str.Trim().ToLower()
-                    $results.Add("W|$key|$str|$Base|$esid")
+                    $results.Add("W|$key|$str|$Base|$esid|$eline|$SourcePath|$occ")
                 }
                 'S' {
                     $key = $str.ToLower()
-                    $results.Add("S|$key|$str|$Base|$esid")
+                    $results.Add("S|$key|$str|$Base|$esid|$eline|$SourcePath|$occ")
                 }
                 'F' {
-                    $results.Add("F|$str|$str|$Base|$esid")
+                    $results.Add("F|$str|$str|$Base|$esid|$eline|$SourcePath|$occ")
                 }
             }
         }
@@ -534,8 +553,96 @@ Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
 
         try {
             $preprocessed = Invoke-Preprocessor -File $file -CI $ci -IsHeader $isHeader
-            $extracted = Extract-Strings -Content $preprocessed -Base $base
+            $extracted = Extract-Strings -Content $preprocessed -Base $base -SourcePath $file
             foreach ($r in $extracted) { $allResults.Add($r) }
+
+            # Phase 0.5: 处理 #define 中的 LA_ 调用
+            # 支持多行续行（以 \ 结尾的行会与后续行合并）
+            $srcLines = [System.IO.File]::ReadAllLines($file)
+            $defineBlocks = @()  # 每个元素: @{ StartLine; Content }
+            
+            $inDefine = $false
+            $startLine = 0
+            $content = ""
+            
+            for ($lineIdx = 0; $lineIdx -lt $srcLines.Count; $lineIdx++) {
+                $line = $srcLines[$lineIdx]
+                
+                # 检查是否是 #define 开头
+                if ($line -match '^\s*#\s*define\s') {
+                    $inDefine = $true
+                    $startLine = $lineIdx + 1
+                    $content = $line
+                } elseif ($inDefine) {
+                    $content += " " + $line
+                }
+                
+                # 检查是否续行（以 \ 结尾）
+                if ($inDefine -and $line -match '\\\s*$') {
+                    $content = $content -replace '\\\s*$', ''
+                    continue
+                }
+                
+                # 续行结束或非续行，处理累积的内容
+                if ($inDefine) {
+                    if ($content -match 'LA_C?[WSF]\(') {
+                        $defineBlocks += @{ StartLine = $startLine; Content = $content }
+                    }
+                    $inDefine = $false
+                    $content = ""
+                }
+            }
+
+            if ($defineBlocks.Count -gt 0) {
+                # 生成虚拟探测代码
+                $probeLines = [System.Collections.Generic.List[string]]::new()
+                # 转义 C 字符串特殊字符：\ → /, " → \"
+                $absPath = (Resolve-Path $file).Path.Replace('\', '/').Replace('"', '\"')
+                $probeLines.Add("#include `"$absPath`"")
+
+                foreach ($db in $defineBlocks) {
+                    $lineNo = $db.StartLine
+                    $lineContent = $db.Content
+                    # 提取该块所有 LA_C?[WSF](...) 调用
+                    $probeNum = 0
+                    $pos = 0
+                    while ($pos -lt $lineContent.Length) {
+                        $rest = $lineContent.Substring($pos)
+                        $m = [regex]::Match($rest, 'LA_C?[WSF]\(')
+                        if (-not $m.Success) { break }
+                        $start = $pos + $m.Index
+                        # 找匹配的右括号
+                        $depth = 1
+                        $ppos = $start + $m.Length
+                        while ($ppos -lt $lineContent.Length -and $depth -gt 0) {
+                            $c = $lineContent[$ppos]
+                            if ($c -eq '(') { $depth++ }
+                            elseif ($c -eq ')') { $depth-- }
+                            $ppos++
+                        }
+                        if ($depth -eq 0) {
+                            $call = $lineContent.Substring($start, $ppos - $start)
+                            $probeNum++
+                            $probeLines.Add("#line $lineNo `"$file`"")
+                            $probeLines.Add("static inline void __i18n_probe_${lineNo}_${probeNum}() { $call; }")
+                        }
+                        $pos = $ppos
+                    }
+                }
+
+                # 预处理探测文件
+                $probeTmp = [System.IO.Path]::GetTempFileName() + ".c"
+                try {
+                    [System.IO.File]::WriteAllLines($probeTmp, $probeLines)
+                    $probePreprocessed = Invoke-Preprocessor -File $probeTmp -CI $ci -IsHeader $false
+                    $probeExtracted = Extract-Strings -Content $probePreprocessed -Base $base -SourcePath $file
+                    foreach ($r in $probeExtracted) { $allResults.Add($r) }
+                } catch {
+                    if ($DebugMode) { Write-Warning "Warning: probe preprocessing failed for ${base}: $_" }
+                } finally {
+                    Remove-Item $probeTmp -ErrorAction SilentlyContinue
+                }
+            }
         } catch {
             Write-Warning "Warning: preprocessing failed for ${base}: $_"
         }
@@ -589,7 +696,7 @@ function Aggregate-ByType {
     $files = @{}
     $sids  = @{}
     foreach ($line in $filtered) {
-        $parts = $line -split '\|', 5
+        $parts = $line -split '\|'
         $key  = $parts[1]
         $str  = $parts[2]
         $file = $parts[3]
@@ -617,6 +724,17 @@ function Aggregate-ByType {
 # ============================================================================
 
 $allLines    = [System.IO.File]::ReadAllLines($TempAll)
+
+# 记录每个宏调用位置（file|line|occ|type|key|sid）供回写使用
+$lineRaw = [System.Collections.Generic.List[string]]::new()
+foreach ($line in $allLines) {
+    $parts = $line -split '\|'
+    if ($parts.Count -lt 8) { continue }
+    if ($parts[5] -notmatch '^\d+$' -or $parts[7] -notmatch '^\d+$') { continue }
+    $lineRaw.Add("$($parts[6])|$($parts[5])|$($parts[7])|$($parts[0])|$($parts[1])|$($parts[4])")
+}
+[System.IO.File]::WriteAllLines($TempLineRaw, $lineRaw, [System.Text.UTF8Encoding]::new($false))
+
 $wordLines   = @(Aggregate-ByType -Lines $allLines -Type "W")
 $stringLines = @(Aggregate-ByType -Lines $allLines -Type "S")
 $formatLines = @(Aggregate-ByType -Lines $allLines -Type "F")
@@ -690,6 +808,37 @@ $hLines.Add("")
 $hLines.Add("enum {")
 $hLines.Add("    LA_PRED = LA_PREDEFINED,  /* 基础 ID，后续 ID 从此开始递增 */")
 $hLines.Add("")
+
+# --- 预加载旧文件数据（Phase 1b 需要）---
+# 从旧 .LANG.c 提取 SID→类型→字符串映射
+$oldSidMap = @{}     # SID → en_string
+$oldSidType = @{}    # SID → type (W/S/F)
+if (Test-Path $OutputC) {
+    Get-Content $OutputC | ForEach-Object {
+        if ($_ -match '\[_?LA_([WSF])?\d+\]\s*=\s*"((?:[^"\\]|\\.)*)",\s*/\*\s*SID:(\d+)') {
+            $t = if ($Matches[1]) { $Matches[1] } else { 'F' }
+            $val = $Matches[2]; $s2 = [int]$Matches[3]
+            if ($s2 -gt 0 -and -not $oldSidMap.ContainsKey($s2)) {
+                $oldSidMap[$s2] = $val
+                $oldSidType[$s2] = $t
+            }
+        }
+    }
+}
+
+# 从旧 .LANG.h 提取条目状态（disabled / remove）
+$oldEnumStatus = @{}   # SID → status ('disabled' / 'remove' / '')
+if (Test-Path $OutputH) {
+    Get-Content $OutputH | ForEach-Object {
+        if ($_ -match 'LA_([WSF])(\d+),') {
+            $sSid = [int]$Matches[2]
+            $status = ''
+            if ($_ -match '/\*\s*disabled\s') { $status = 'disabled' }
+            elseif ($_ -match '/\*\s*remove\s') { $status = 'remove' }
+            $oldEnumStatus[$sSid] = $status
+        }
+    }
+}
 
 # --- Phase 1: SID 分配 + map 建立（两种模式共用） ---
 
@@ -839,36 +988,6 @@ $hLines.Add("#endif /* LANG_H__ */")
 # ============================================================================
 # 生成 .LANG.c
 # ============================================================================
-
-# 从旧 .LANG.c 提取 SID→类型→字符串映射（变更检测用，必须在覆写前完成）
-$oldSidMap = @{}     # SID → en_string
-$oldSidType = @{}    # SID → type (W/S/F)
-if (Test-Path $OutputC) {
-    Get-Content $OutputC | ForEach-Object {
-        if ($_ -match '\[_?LA_([WSF])?\d+\]\s*=\s*"((?:[^"\\]|\\.)*)",\s*/\*\s*SID:(\d+)') {
-            $t = if ($Matches[1]) { $Matches[1] } else { 'F' }
-            $val = $Matches[2]; $s2 = [int]$Matches[3]
-            if ($s2 -gt 0 -and -not $oldSidMap.ContainsKey($s2)) {
-                $oldSidMap[$s2] = $val
-                $oldSidType[$s2] = $t
-            }
-        }
-    }
-}
-
-# 从旧 .LANG.h 提取条目状态（disabled / remove）
-$oldEnumStatus = @{}   # SID → status ('disabled' / 'remove' / '')
-if (Test-Path $OutputH) {
-    Get-Content $OutputH | ForEach-Object {
-        if ($_ -match 'LA_([WSF])(\d+),') {
-            $sSid = [int]$Matches[2]
-            $status = ''
-            if ($_ -match '/\*\s*disabled\s') { $status = 'disabled' }
-            elseif ($_ -match '/\*\s*remove\s') { $status = 'remove' }
-            $oldEnumStatus[$sSid] = $status
-        }
-    }
-}
 
 $cLines = [System.Collections.Generic.List[string]]::new()
 $cLines.Add("/*")
@@ -1096,6 +1215,19 @@ if ($ImportSuffix -ne "") {
 $mapLines = $map.GetEnumerator() | ForEach-Object { "$($_.Key)|$($_.Value)" }
 [System.IO.File]::WriteAllLines($TempMap, $mapLines, [System.Text.UTF8Encoding]::new($false))
 
+# 用 TYPE|key 映射更新每个源码位置，得到 file|line|occ|id_name|sid
+$lineMapLines = [System.Collections.Generic.List[string]]::new()
+foreach ($lr in $lineRaw) {
+    $parts = $lr -split '\|', 6
+    if ($parts.Count -lt 6) { continue }
+    $k = "$($parts[3])|$($parts[4])"
+    if (-not $map.ContainsKey($k)) { continue }
+    $idName = $map[$k]
+    $sidVal = if ($mapSid.ContainsKey($k)) { $mapSid[$k] } else { 0 }
+    $lineMapLines.Add("$($parts[0])|$($parts[1])|$($parts[2])|$idName|$sidVal")
+}
+[System.IO.File]::WriteAllLines($TempLineMap, $lineMapLines, [System.Text.UTF8Encoding]::new($false))
+
 # ============================================================================
 # 输出生成结果概览
 # ============================================================================
@@ -1113,57 +1245,37 @@ Write-Host ""
 
 Write-Host "Updating source files..."
 
-# 正则替换 MatchEvaluator（PS 5.1+ 支持 ScriptBlock 作为 MatchEvaluator）
-# 可选消耗已有的数字第三参数（SID），避免重复追加
-# 支持 LA_W/LA_CW, LA_S/LA_CS, LA_F/LA_CF 别名
-$reW = [regex]'(LA_C?W\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
-$reS = [regex]'(LA_C?S\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
-$reF = [regex]'(LA_C?F\s*\(\s*(?:u8|[uLU])?"((?:[^"\\]|\\.)*)"\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
-# 多段字符串字面量（如 PRIu64 宏拼接）：强制 ID/SID 为 0, 0
-$reMultiSeg = [regex]'(LA_C?[WSF]\s*\(\s*(?:u8|[uLU])?"(?:[^"\\]|\\.)*"\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*"(?:[^"\\]|\\.)*"\s*)+,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
+$lineMapRef = @{}
+foreach ($ln in [System.IO.File]::ReadAllLines($TempLineMap)) {
+    $parts = $ln -split '\|', 5
+    if ($parts.Count -lt 5) { continue }
+    $lineMapRef["$($parts[0])|$($parts[1])|$($parts[2])"] = "$($parts[3])|$($parts[4])"
+}
 
-# 闭包引用 $map 和 $mapSid
-$mapRef    = $map
-$mapSidRef = $mapSid
+# 匹配: LA_W/LA_S/LA_F 及其 C 别名，首参数支持多段拼串（如 PRIu64）
+$reMacro = [regex]'(LA_C?[WSF]\s*\(\s*(?:(?:u8|[uLU])?"(?:[^"\\]|\\.)*"\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*(?:u8|[uLU])?"(?:[^"\\]|\\.)*"\s*)*)\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
 
 Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
     Where-Object { $_.FullName -ne $OutputH -and $_.FullName -ne $OutputC } |
     ForEach-Object {
         $file = $_.FullName
         try {
-            $content = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
+            $lines = [System.IO.File]::ReadAllLines($file, [System.Text.Encoding]::UTF8)
+            for ($idx = 0; $idx -lt $lines.Count; $idx++) {
+                $lineNo = $idx + 1
+                $occ = 0
+                $lines[$idx] = $reMacro.Replace($lines[$idx], [System.Text.RegularExpressions.MatchEvaluator]{
+                    param($m)
+                    $occ++
+                    $lk = "$file|$lineNo|$occ"
+                    if (-not $lineMapRef.ContainsKey($lk)) { return $m.Value }
+                    $v = $lineMapRef[$lk] -split '\|', 2
+                    if ($v.Count -lt 2) { return $m.Value }
+                    return "$($m.Groups[1].Value)$($v[0]), $($v[1])"
+                })
+            }
 
-            # 先处理多段字符串字面量（如 PRIu64 宏拼接），将旧 ID/SID 清零
-            $content = $reMultiSeg.Replace($content, '${1}0, 0')
-
-            $content = $reW.Replace($content, [System.Text.RegularExpressions.MatchEvaluator]{
-                param($m)
-                $prefix  = $m.Groups[1].Value
-                $key     = $m.Groups[2].Value.Trim().ToLower()
-                $idVal   = if ($mapRef.ContainsKey("W|$key"))    { $mapRef["W|$key"]    } else { "0" }
-                $sidVal  = if ($mapSidRef.ContainsKey("W|$key")) { $mapSidRef["W|$key"] } else { 0 }
-                "$prefix$idVal, $sidVal"
-            })
-
-            $content = $reS.Replace($content, [System.Text.RegularExpressions.MatchEvaluator]{
-                param($m)
-                $prefix  = $m.Groups[1].Value
-                $key     = $m.Groups[2].Value.ToLower()
-                $idVal   = if ($mapRef.ContainsKey("S|$key"))    { $mapRef["S|$key"]    } else { "0" }
-                $sidVal  = if ($mapSidRef.ContainsKey("S|$key")) { $mapSidRef["S|$key"] } else { 0 }
-                "$prefix$idVal, $sidVal"
-            })
-
-            $content = $reF.Replace($content, [System.Text.RegularExpressions.MatchEvaluator]{
-                param($m)
-                $prefix  = $m.Groups[1].Value
-                $str2    = $m.Groups[2].Value
-                $idVal   = if ($mapRef.ContainsKey("F|$str2"))    { $mapRef["F|$str2"]    } else { "0" }
-                $sidVal  = if ($mapSidRef.ContainsKey("F|$str2")) { $mapSidRef["F|$str2"] } else { 0 }
-                "$prefix$idVal, $sidVal"
-            })
-
-            [System.IO.File]::WriteAllText($file, $content, [System.Text.UTF8Encoding]::new($false))
+            [System.IO.File]::WriteAllLines($file, $lines, [System.Text.UTF8Encoding]::new($false))
             Write-Host "  Updated: $($_.Name)"
         } catch {
             Write-Warning "  Failed to update $($_.Name): $_"
@@ -1190,7 +1302,7 @@ if ($SidNext -gt $SidNextStart) {
 # 清理临时文件
 Remove-Item $TempMarkerH -ErrorAction SilentlyContinue
 if (-not $DebugMode) {
-    foreach ($f in @($TempAll,$TempWords,$TempFormats,$TempStrings,$TempMap)) {
+    foreach ($f in @($TempAll,$TempWords,$TempFormats,$TempStrings,$TempMap,$TempLineRaw,$TempLineMap)) {
         Remove-Item $f -ErrorAction SilentlyContinue
     }
 }

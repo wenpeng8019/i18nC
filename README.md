@@ -327,6 +327,20 @@ Port %d\n
 
 ---
 
+## 已知限制
+
+以下场景当前不支持自动处理：
+
+| 场景 | 说明 |
+|---|---|
+| 间接宏别名 | `#define MSG LA_W` 后使用 `MSG("...", ...)` 无法被提取 |
+| `#if 0` 代码块 | 被条件编译排除的字符串不会被提取（预期行为） |
+| 宏拼接格式符 | `LA_F("%" PRIu64, ...)` 等涉及 `<inttypes.h>` 的调用会被自动重置为 `0, 0` |
+
+详细技术说明请参见 [INTERNALS.md](INTERNALS.md)。
+
+---
+
 ## 另请参阅
 
-- [INTERNALS.md](INTERNALS.md) — 提取工具内部原理（Marker 注入、awk 解析器、源码回写）
+- [INTERNALS.md](INTERNALS.md) — 提取工具内部原理（Marker 注入、awk 解析器、#define 探测、源码回写）

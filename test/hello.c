@@ -29,6 +29,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <inttypes.h>  /* for PRIu64 */
 
 #ifdef I18N_ENABLED
 /*
@@ -81,6 +82,27 @@
 /* LA_F without % -- i18n.sh should auto-add "% " prefix in generated code */
 #define F_PLAIN   LA_F("hello world",    LA_F18, 18)
 
+/* Phase 0.5 test: PRIu64 in #define macro — tests that i18n.sh can extract
+ * LA_F from macro definitions (not just call sites).
+ * PRIu64 expands to "llu" on most platforms, so the extracted key will be
+ * "id=%" + "llu" -> "id=%llu" (not "id=%" PRIu64).
+ *
+ * NOTE: Using inline function wrapper instead of direct #define, because
+ * #define bodies are not rewritten by Phase 3 line-based SID renumbering.
+ * The inline function allows the LA_F call to be on a normal code line
+ * where __LINE__ works for SID tracking across --ndebug mode switches.
+ */
+static inline const char *_f_priu64(void) {
+    return LA_F("id=%" PRIu64, LA_F19, 19);
+}
+#define F_PRIU64 _f_priu64()
+
+/* Multi-line #define continuation test (Phase 0.5 续行符支持)
+ * Tests that LA_F inside a multi-line #define is correctly extracted.
+ */
+#define F_MULTILINE \
+    LA_F("multiline message", LA_F20, 20)
+
 /* Escape sequence preservation test */
 #define S_ESCAPE  LA_S("Line1\nLine2\tEnd", LA_S11, 11)
 
@@ -127,6 +149,7 @@ static void test_literals(void)
     CHECK("F_RESULT contains %s",        strstr(F_RESULT, "%s")   != NULL);
     CHECK("F_COUNT  contains %d",        strstr(F_COUNT,  "%d")   != NULL);
     CHECK("F_PLAIN == \"hello world\"",  strcmp(F_PLAIN,  "hello world") == 0);
+    CHECK("F_PRIU64 contains PRIu64",    strstr(F_PRIU64, "llu") != NULL || strstr(F_PRIU64, "lu") != NULL);
     CHECK("S_ESCAPE has backslash-n",       strstr(S_ESCAPE, "\n")   != NULL);
 #else
     /* I18N mode: lang_init() called in main(); verify non-empty and English */
@@ -140,6 +163,7 @@ static void test_literals(void)
                                 strcmp(S_HELLO, "Hello, World!")   == 0);
     /* LA_F without % should have "% " prefix added by i18n.sh */
     CHECK("F_PLAIN == \"% hello world\"", strcmp(F_PLAIN, "% hello world") == 0);
+    CHECK("F_PRIU64 has PRIu64",         strstr(F_PRIU64, "llu") != NULL || strstr(F_PRIU64, "lu") != NULL);
     CHECK("S_ESCAPE has backslash-n",   strstr(S_ESCAPE, "\n")   != NULL);
 #endif
 
@@ -195,7 +219,8 @@ static void test_load_tx(void)
         "  [%s] %s\n"              /* F15: RESULT -- keep specifiers identical */
         "\xe8\xaf\xad\xe8\xa8\x80: %s\n"               /* F16: LANG   */
         "\xe5\xb7\xb2\xe8\xbf\x90\xe8\xa1\x8c: %d\n"   /* F17: COUNT  */
-        "% hello world\n";                             /* F18: PLAIN -- no format specs */
+        "% hello world\n"                              /* F18: PLAIN -- no format specs */
+        "id=%llu\n";                                   /* F19: PRIU64 */
 
     int ok = lang_load_tx(LA_RID, cn_tx);
     CHECK("lang_load_tx succeeds",                ok == 0);
@@ -214,7 +239,8 @@ static void test_load_tx(void)
         "  [%s] %s\n"
         "lang: %s\n"
         "count: %s\n"   /* wrong: %d -> %s */
-        "% hello world\n";  /* 18 entries matching LA_NUM */
+        "% hello world\n"
+        "id=%llu\n";    /* 19 entries matching LA_NUM */
     int bad_ok = lang_load_tx(LA_RID, bad_tx);
     CHECK("bad format spec rejected", bad_ok != 0);
 

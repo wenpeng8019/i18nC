@@ -55,9 +55,9 @@ check_file "LANG.h auto-created" "LANG.h"
 check_contains "LA_NUM defined"  "LA_NUM"    ".LANG.h"
 check_contains "lang_en defined" "lang_en"   ".LANG.c"
 check_contains "SID_NEXT in .i18n" "SID_NEXT" ".i18n"
-# Expected: 8W (5 unique + 3 wide) + 6S (5 unique + 1 utf8) + 4F (3+1 plain) = 18 strings → SID_NEXT=19
+# Expected: 8W (5 unique + 3 wide) + 6S (5 unique + 1 utf8) + 6F (4 original + 1 priu64 + 1 multiline) = 20 strings → SID_NEXT=21
 # Dedup (W_OK_DUP*, S_HELLO_DUP) merge to existing IDs, don't allocate new SIDs.
-check_contains "SID_NEXT=19"     "SID_NEXT=19" ".i18n"
+check_contains "SID_NEXT=21"     "SID_NEXT=21" ".i18n"
 check_contains "LA_FMT_START in .LANG.h" "LA_FMT_START" ".LANG.h"
 
 # ---------------------------------------------------------------------------
@@ -152,8 +152,8 @@ echo "=== [Stage 4] First --import cn (all new) ==="
 (cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /tmp/i18n_import1.log 2>&1
 
 check_file "LANG.cn.h created"           "LANG.cn.h"
-# 应报告 18 条新字符串（8W + 6S + 4F）
-check_contains "NOTE: 18 new" "NOTE: 18 new" /tmp/i18n_import1.log
+# 应报告 19 条新字符串（8W + 6S + 5F，包括 F_PRIU64）
+check_contains "NOTE: 19 new" "NOTE: 19 new" /tmp/i18n_import1.log
 # 新条目含 "/* SID:N new */" 注释
 check_contains "new comment in LANG.cn.h" "new \*/" LANG.cn.h
 
@@ -579,6 +579,56 @@ mv hello.c.stage14.bak hello.c
 mv .LANG.h.stage14.bak .LANG.h
 mv .LANG.c.stage14.bak .LANG.c
 mv LANG.cn.h.stage14.bak LANG.cn.h
+
+# ---------------------------------------------------------------------------
+# Stage 15 -- Phase 0.5: #define with PRIu64 extraction
+#   Verifies that LA_F inside #define macros (with PRIu64) is correctly
+#   extracted and assigned SID, even when SID starts at 0.
+#   This tests the "probe generation" mechanism that handles #define bodies.
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 15] Phase 0.5: #define with PRIu64 extraction ==="
+cp hello.c hello.c.stage15.bak
+cp .LANG.h .LANG.h.stage15.bak
+cp .LANG.c .LANG.c.stage15.bak
+cp .i18n .i18n.stage15.bak
+
+# Add a new #define with PRIu64 and SID=0 (simulating first-time scenario)
+cat >> hello.c << 'STAGE15_EOF'
+
+/* Stage 15: Phase 0.5 test - new #define with PRIu64, SID=0 */
+#define F_STAGE15 LA_F("session=%" PRIu64 "\n", 0, 0)
+STAGE15_EOF
+
+# Run i18n.sh to extract and assign SID
+(cd "$I18N_DIR" && bash i18n.sh test --name hello) > /tmp/i18n_stage15.log 2>&1
+
+# Verify F_STAGE15 was extracted and got a non-zero SID
+check_contains "15a: F_STAGE15 in .LANG.h"       "session=%.*llu"  .LANG.c
+# Verify hello.c was updated with non-zero SID (the 0 replaced)
+if grep -q 'F_STAGE15.*LA_F.*LA_F[0-9]\+' hello.c; then
+    ok "15b: F_STAGE15 got valid enum ID"
+else
+    fail "15b: F_STAGE15 enum ID not updated"
+fi
+if grep -q 'F_STAGE15.*LA_F.*[1-9][0-9]*' hello.c; then
+    ok "15c: F_STAGE15 got non-zero SID"
+else
+    fail "15c: F_STAGE15 SID still 0"
+fi
+
+# Test ndebug mode with the new macro
+(cd "$I18N_DIR" && bash i18n.sh test --name hello --ndebug) > /tmp/i18n_stage15_ndebug.log 2>&1
+echo "  Building: hello (ndebug, Phase 0.5 test) ..."
+make -s hello
+check "15d: hello builds (Phase 0.5)"   test -x hello
+check "15e: hello runs (Phase 0.5)"     ./hello
+
+# Restore
+mv hello.c.stage15.bak hello.c
+mv .LANG.h.stage15.bak .LANG.h
+mv .LANG.c.stage15.bak .LANG.c
+mv .i18n.stage15.bak .i18n
 
 # ---------------------------------------------------------------------------
 # 汇总
