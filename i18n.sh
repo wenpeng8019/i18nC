@@ -479,6 +479,8 @@ _cc_and_flags_for_file() {
 # 利用 #ifndef 保护（i18n.h 中已同步添加），使此处定义不被 i18n.h 覆盖
 _marker_h=$(mktemp /tmp/i18n_markers_XXXXXX)  # BSD mktemp 要求 X 在末尾，不带后缀
 cat > "$_marker_h" <<'MARKER_EOF'
+/* 屏蔽用户的 LANG.h — marker 已自带 LA_W/S/F 定义，无需从 LANG.h 引入 */
+#define LANG_H_
 /* 从 variadic args 中提取 SID（第2个参数），缺省为 0 */
 #define _I18N_SID_GET(_id, _sid, ...) _sid
 #define _I18N_SID(...) _I18N_SID_GET(__VA_ARGS__, 0, 0)
@@ -582,8 +584,8 @@ END {
         if (result != "") {
             occ = 0
             if (eline > 0) {
-                line_occ[eline]++
-                occ = line_occ[eline]
+                line_type_occ[eline, tp]++
+                occ = line_type_occ[eline, tp]
             }
             if (tp == "W") {
                 key = result; gsub(/^[ \t]+|[ \t]+$/, "", key)
@@ -905,7 +907,7 @@ if [ "$format_count" -gt 0 ]; then
     done < "$TEMP_FORMATS"
 fi
 
-# 用 TYPE|key 映射更新每个源码位置，得到 file|line|occ|id_name|sid
+# 用 TYPE|key 映射更新每个源码位置，得到 file|line|type|occ|id_name|sid
 awk -F'|' '
     FNR==NR {
         map_id[$1 SUBSEP $2] = $3
@@ -915,7 +917,7 @@ awk -F'|' '
     {
         k = $4 SUBSEP $5
         if (k in map_id) {
-            print $1 "|" $2 "|" $3 "|" map_id[k] "|" map_sid[k]
+            print $1 "|" $2 "|" $4 "|" $3 "|" map_id[k] "|" map_sid[k]
         }
     }
 ' "$TEMP_MAP" "$TEMP_LINE_RAW" > "$TEMP_LINE_MAP"
@@ -1477,17 +1479,17 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
         BEGIN {
             while ((getline ln < mapfile) > 0) {
                 n = split(ln, a, "|");
-                if (n >= 5) {
-                    k = a[1] SUBSEP a[2] SUBSEP a[3]
-                    mapn[k] = a[4]
-                    mapsid[k] = a[5]
+                if (n >= 6) {
+                    k = a[1] SUBSEP a[2] SUBSEP a[3] SUBSEP a[4]
+                    mapn[k] = a[5]
+                    mapsid[k] = a[6]
                 }
             }
             close(mapfile)
         }
         {
             line = $0; result = ""; i = 1; L = length(line)
-            occ = 0
+            delete type_occ
             while (i <= L) {
                 if (substr(line,i,3) == "LA_") {
                     t = substr(line,i+3,1)
@@ -1504,8 +1506,8 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                         j = i+skip
                         while (j <= L && substr(line,j,1) ~ /[ \t]/) j++
                         if (j <= L && substr(line,j,1) == "(") {
-                            occ++
-                            mapk = curfile SUBSEP FNR SUBSEP occ
+                            type_occ[t]++
+                            mapk = curfile SUBSEP FNR SUBSEP t SUBSEP type_occ[t]
                             new_id = mapn[mapk]
                             new_sid = mapsid[mapk]
                             if (new_id == "") {

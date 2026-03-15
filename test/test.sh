@@ -152,8 +152,8 @@ echo "=== [Stage 4] First --import cn (all new) ==="
 (cd "$I18N_DIR" && bash i18n.sh test --name hello --import cn) > /tmp/i18n_import1.log 2>&1
 
 check_file "LANG.cn.h created"           "LANG.cn.h"
-# 应报告 19 条新字符串（8W + 6S + 5F，包括 F_PRIU64）
-check_contains "NOTE: 19 new" "NOTE: 19 new" /tmp/i18n_import1.log
+# 应报告 20 条新字符串（8W + 6S + 6F，包括 F_PRIU64 和 F_MULTILINE）
+check_contains "NOTE: 20 new" "NOTE: 20 new" /tmp/i18n_import1.log
 # 新条目含 "/* SID:N new */" 注释
 check_contains "new comment in LANG.cn.h" "new \*/" LANG.cn.h
 
@@ -629,6 +629,55 @@ mv hello.c.stage15.bak hello.c
 mv .LANG.h.stage15.bak .LANG.h
 mv .LANG.c.stage15.bak .LANG.c
 mv .i18n.stage15.bak .i18n
+
+# ---------------------------------------------------------------------------
+# Stage 16 -- Type-mismatch regression test (per-type occ counting)
+#   Bug: When a #define containing LA_W is expanded on the same line as a
+#   direct LA_F call, the preprocessor produces both W and F markers on that
+#   line. Without per-type occurrence counting, the rewrite assigns the wrong
+#   type prefix (e.g. LA_W ID written into an LA_F call).
+#   Test: Append mixed-type pattern to hello.c, run gen, verify LA_F gets
+#   LA_F prefix (not LA_W).
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [Stage 16] Type-mismatch regression (per-type occ counting) ==="
+cp hello.c hello.c.stage16.bak
+cp .LANG.h .LANG.h.stage16.bak
+cp .LANG.c .LANG.c.stage16.bak
+cp .i18n .i18n.stage16.bak
+
+# Append: #define with LA_W, used as arg to direct LA_F on the same line.
+# After cc -E, both W and F markers appear on the printf line.
+cat >> hello.c << 'STAGE16_EOF'
+
+/* Stage 16: type-mismatch regression test */
+#define W_TYPETEST LA_W("typetest", 0, 0)
+static void _stage16_unused(void) {
+    printf(LA_F("typecheck: %s\n", 0, 0), W_TYPETEST);
+}
+STAGE16_EOF
+
+(cd "$I18N_DIR" && bash i18n.sh test --name hello) > /tmp/i18n_stage16.log 2>&1
+
+# The printf line's LA_F must have LA_F prefix, NOT LA_W
+if grep -q 'printf(LA_F("typecheck:.*LA_F[0-9]' hello.c; then
+    ok "16a: LA_F call has correct LA_F prefix"
+else
+    fail "16a: LA_F call missing LA_F prefix (type-mismatch bug)"
+fi
+
+# Verify no type-mismatch: LA_F("...", LA_W...) must not exist
+if grep -q 'LA_F("typecheck:.*LA_W[0-9]' hello.c; then
+    fail "16b: type-mismatch detected (LA_F with LA_W ID)"
+else
+    ok "16b: no type-mismatch (correct per-type counting)"
+fi
+
+# Restore
+mv hello.c.stage16.bak hello.c
+mv .LANG.h.stage16.bak .LANG.h
+mv .LANG.c.stage16.bak .LANG.c
+mv .i18n.stage16.bak .i18n
 
 # ---------------------------------------------------------------------------
 # 汇总

@@ -509,9 +509,10 @@ function Extract-Strings {
         if ($str -ne '') {
             $occ = 0
             if ($eline -gt 0) {
-                if (-not $lineOcc.ContainsKey($eline)) { $lineOcc[$eline] = 0 }
-                $lineOcc[$eline] = [int]$lineOcc[$eline] + 1
-                $occ = [int]$lineOcc[$eline]
+                $ltk = "$eline|$tp"
+                if (-not $lineOcc.ContainsKey($ltk)) { $lineOcc[$ltk] = 0 }
+                $lineOcc[$ltk] = [int]$lineOcc[$ltk] + 1
+                $occ = [int]$lineOcc[$ltk]
             }
             switch ($tp) {
                 'W' {
@@ -678,8 +679,10 @@ function Aggregate-Entries {
             $files[$key] = $file
         }
     }
-    # 按 key 字母序排序后输出
-    return $seen.Keys | Sort-Object | ForEach-Object {
+    # 按 key 字节序排序后输出（与 bash LC_ALL=C sort 一致）
+    $sortedKeys = @($seen.Keys)
+    [Array]::Sort($sortedKeys, [System.StringComparer]::Ordinal)
+    return $sortedKeys | ForEach-Object {
         $k = $_
         "${Type}|$k|$($strs[$k])|$($files[$k])"
     }
@@ -713,7 +716,9 @@ function Aggregate-ByType {
             $sids[$key]  = $sid
         }
     }
-    return $seen.Keys | Sort-Object | ForEach-Object {
+    $sortedKeys = @($seen.Keys)
+    [Array]::Sort($sortedKeys, [System.StringComparer]::Ordinal)
+    return $sortedKeys | ForEach-Object {
         $k = $_
         "${Type}|$k|$($strs[$k])|$($files[$k])|$($sids[$k])"
     }
@@ -1215,7 +1220,7 @@ if ($ImportSuffix -ne "") {
 $mapLines = $map.GetEnumerator() | ForEach-Object { "$($_.Key)|$($_.Value)" }
 [System.IO.File]::WriteAllLines($TempMap, $mapLines, [System.Text.UTF8Encoding]::new($false))
 
-# 用 TYPE|key 映射更新每个源码位置，得到 file|line|occ|id_name|sid
+# 用 TYPE|key 映射更新每个源码位置，得到 file|line|type|occ|id_name|sid
 $lineMapLines = [System.Collections.Generic.List[string]]::new()
 foreach ($lr in $lineRaw) {
     $parts = $lr -split '\|', 6
@@ -1224,7 +1229,7 @@ foreach ($lr in $lineRaw) {
     if (-not $map.ContainsKey($k)) { continue }
     $idName = $map[$k]
     $sidVal = if ($mapSid.ContainsKey($k)) { $mapSid[$k] } else { 0 }
-    $lineMapLines.Add("$($parts[0])|$($parts[1])|$($parts[2])|$idName|$sidVal")
+    $lineMapLines.Add("$($parts[0])|$($parts[1])|$($parts[3])|$($parts[2])|$idName|$sidVal")
 }
 [System.IO.File]::WriteAllLines($TempLineMap, $lineMapLines, [System.Text.UTF8Encoding]::new($false))
 
@@ -1247,13 +1252,13 @@ Write-Host "Updating source files..."
 
 $lineMapRef = @{}
 foreach ($ln in [System.IO.File]::ReadAllLines($TempLineMap)) {
-    $parts = $ln -split '\|', 5
-    if ($parts.Count -lt 5) { continue }
-    $lineMapRef["$($parts[0])|$($parts[1])|$($parts[2])"] = "$($parts[3])|$($parts[4])"
+    $parts = $ln -split '\|', 6
+    if ($parts.Count -lt 6) { continue }
+    $lineMapRef["$($parts[0])|$($parts[1])|$($parts[2])|$($parts[3])"] = "$($parts[4])|$($parts[5])"
 }
 
 # 匹配: LA_W/LA_S/LA_F 及其 C 别名，首参数支持多段拼串（如 PRIu64）
-$reMacro = [regex]'(LA_C?[WSF]\s*\(\s*(?:(?:u8|[uLU])?"(?:[^"\\]|\\.)*"\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*(?:u8|[uLU])?"(?:[^"\\]|\\.)*"\s*)*)\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
+$reMacro = [regex]'(LA_C?[WSF]\s*\(\s*(?:(?:u8|[uLU])?"(?:[^"\\]|\\.)*"\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*(?:(?:u8|[uLU])?"(?:[^"\\]|\\.)*"\s*)?)*)\s*,\s*)(?:0|LA_[WFS]\d+)(?:\s*,\s*\d+)?'
 
 Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
     Where-Object { $_.FullName -ne $OutputH -and $_.FullName -ne $OutputC } |
@@ -1263,11 +1268,14 @@ Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
             $lines = [System.IO.File]::ReadAllLines($file, [System.Text.Encoding]::UTF8)
             for ($idx = 0; $idx -lt $lines.Count; $idx++) {
                 $lineNo = $idx + 1
-                $occ = 0
+                $typeOcc = @{}
                 $lines[$idx] = $reMacro.Replace($lines[$idx], [System.Text.RegularExpressions.MatchEvaluator]{
                     param($m)
-                    $occ++
-                    $lk = "$file|$lineNo|$occ"
+                    $t = $m.Groups[1].Value
+                    if ($t -match 'LA_C?([WSF])') { $t = $Matches[1] } else { return $m.Value }
+                    if (-not $typeOcc.ContainsKey($t)) { $typeOcc[$t] = 0 }
+                    $typeOcc[$t] = [int]$typeOcc[$t] + 1
+                    $lk = "$file|$lineNo|$t|$($typeOcc[$t])"
                     if (-not $lineMapRef.ContainsKey($lk)) { return $m.Value }
                     $v = $lineMapRef[$lk] -split '\|', 2
                     if ($v.Count -lt 2) { return $m.Value }

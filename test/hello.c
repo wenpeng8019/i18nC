@@ -192,7 +192,7 @@ static void test_literals(void)
  *   W1..W8   (ERROR, FAIL, OK, PASS, READY, UTF16, UTF32, WIDE)
  *   S9..S14  (All tests passed, Hello World, ESCAPE, Some tests FAILED,
  *             UTF-8 String, Welcome to i18n)
- *   F15..F18 (RESULT, LANG, COUNT, PLAIN)
+ *   F15..F20 (RESULT, LANG, COUNT, PLAIN, PRIU64, MULTILINE)
  * Format strings must keep identical specifiers or lang_load_tx rejects them.
  * ============================================================================ */
 #ifdef I18N_ENABLED
@@ -220,7 +220,8 @@ static void test_load_tx(void)
         "\xe8\xaf\xad\xe8\xa8\x80: %s\n"               /* F16: LANG   */
         "\xe5\xb7\xb2\xe8\xbf\x90\xe8\xa1\x8c: %d\n"   /* F17: COUNT  */
         "% hello world\n"                              /* F18: PLAIN -- no format specs */
-        "id=%llu\n";                                   /* F19: PRIU64 */
+        "id=%llu\n"                                    /* F19: PRIU64 */
+        "% \xe5\xa4\x9a\xe8\xa1\x8c\xe6\xb6\x88\xe6\x81\xaf\n";  /* F20: MULTILINE */
 
     int ok = lang_load_tx(LA_RID, cn_tx);
     CHECK("lang_load_tx succeeds",                ok == 0);
@@ -240,7 +241,8 @@ static void test_load_tx(void)
         "lang: %s\n"
         "count: %s\n"   /* wrong: %d -> %s */
         "% hello world\n"
-        "id=%llu\n";    /* 19 entries matching LA_NUM */
+        "id=%llu\n"
+        "% multiline msg\n";  /* 20 entries matching LA_NUM */
     int bad_ok = lang_load_tx(LA_RID, bad_tx);
     CHECK("bad format spec rejected", bad_ok != 0);
 
