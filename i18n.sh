@@ -845,6 +845,23 @@ sid=0
 max_sid=0
 first_fmt_id=""
 w_seq=0; s_seq=0; f_seq=0
+TEMP_SID_OWNER=$(mktemp "${TMPDIR:-/tmp}/i18n_sid_owner.XXXXXX")  # SID 冲突检测
+
+# _sid_check sid key — 检查 SID 是否已被不同 key 占用，冲突时分配新 SID
+# 结果写入变量 _sid_result
+_sid_check() {
+    local _sid="$1" _key="$2"
+    local _existing
+    _existing=$(awk -F'|' -v s="$_sid" '$1==s {print $2; exit}' "$TEMP_SID_OWNER")
+    if [ -n "$_existing" ] && [ "$_existing" != "$_key" ]; then
+        echo "WARNING: SID $_sid conflict — reassigning new SID" >&2
+        echo "  existing: $_existing" >&2
+        echo "  conflict: $_key" >&2
+        _sid=$SID_NEXT; SID_NEXT=$((SID_NEXT + 1))
+    fi
+    printf '%s|%s\n' "$_sid" "$_key" >> "$TEMP_SID_OWNER"
+    _sid_result=$_sid
+}
 
 # 词
 if [ "$word_count" -gt 0 ]; then
@@ -853,6 +870,7 @@ if [ "$word_count" -gt 0 ]; then
         if [ "$I18N_REINIT" -ne 0 ] || [ -z "${entry_sid:-}" ] || ! [ "$entry_sid" -gt 0 ] 2>/dev/null; then
             entry_sid=$SID_NEXT; SID_NEXT=$((SID_NEXT + 1))
         fi
+        _sid_check "$entry_sid" "$key"; entry_sid=$_sid_result
         if [ "$NDEBUG_MODE" -eq 1 ]; then
             id_name="LA_W${w_seq}"; w_seq=$((w_seq + 1))
         else
@@ -872,6 +890,7 @@ if [ "$string_count" -gt 0 ]; then
         if [ "$I18N_REINIT" -ne 0 ] || [ -z "${entry_sid:-}" ] || ! [ "$entry_sid" -gt 0 ] 2>/dev/null; then
             entry_sid=$SID_NEXT; SID_NEXT=$((SID_NEXT + 1))
         fi
+        _sid_check "$entry_sid" "$key"; entry_sid=$_sid_result
         if [ "$NDEBUG_MODE" -eq 1 ]; then
             id_name="LA_S${s_seq}"; s_seq=$((s_seq + 1))
         else
@@ -891,6 +910,7 @@ if [ "$format_count" -gt 0 ]; then
         if [ "$I18N_REINIT" -ne 0 ] || [ -z "${entry_sid:-}" ] || ! [ "$entry_sid" -gt 0 ] 2>/dev/null; then
             entry_sid=$SID_NEXT; SID_NEXT=$((SID_NEXT + 1))
         fi
+        _sid_check "$entry_sid" "$key"; entry_sid=$_sid_result
         if [ "$NDEBUG_MODE" -eq 1 ]; then
             id_name="LA_F${f_seq}"; f_seq=$((f_seq + 1))
         else

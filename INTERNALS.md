@@ -301,8 +301,14 @@ SID 在阶段 1 通过 `_I18NSID_` 分隔符嵌入预处理输出，
 1. 从阶段 4 的聚合结果中读取每个条目的已有 SID（第 5 列）
 
 2. 为每个条目分配 SID：
-   - 已有 SID > 0 → 沿用
+   - 已有 SID > 0 → 冲突检查后沿用（见下）
    - 无已有 SID（新条目）→ SID_NEXT 自增
+
+2b. SID 冲突检查（_sid_check）：
+   - 维护 TEMP_SID_OWNER 映射表（SID → key）
+   - 若 SID 已被另一个不同 key 占用，分配新 SID_NEXT 并 WARNING
+   - W、S、F 三个循环共享同一张表
+   - 场景：用户修改字符串内容后未重新运行 i18n.sh，多条不同记录携带旧 SID
 
 3. 如果 .i18n 不存在（I18N_REINIT=1）：
    - 忽略已有 SID，全量从 1 重新分配
@@ -561,6 +567,49 @@ printf("%s %s", LA_W("A", W_A, 1), LA_W("B", W_B, 2));
 ```
 
 **处理方式**：用 `occ`（occurrence）字段记录同一行的第几次出现，回写时按 `(file, line, occ)` 三元组精确匹配。
+
+### 7. SID 冲突——同一 SID 对应多个不同字符串
+
+当用户修改了源码中 `LA_F` 的字符串内容但未重新运行 `i18n.sh` 时，
+多个不同字符串可能携带相同的 SID。
+
+**典型成因**：
+
+假设三处调用原本使用同一字符串，共享 SID 332：
+
+```c
+print("W:", LA_F("Upsert remote cand<%s:%d> failed(OOM)", LA_F332, 332), ...);
+print("E:", LA_F("Upsert remote cand<%s:%d> failed(OOM)", LA_F332, 332), ...);
+print("E:", LA_F("Upsert remote cand<%s:%d> failed(OOM)", LA_F332, 332), ...);
+```
+
+后来用户将三处的字符串分别改为不同内容（使описание更精确），但 SID 标记未同步更新：
+
+```c
+print("W:", LA_F("Duplicate remote candidate<%s:%d>...", LA_F332, 332), ...);
+print("E:", LA_F("Push remote candidate<%s:%d>...",      LA_F332, 332), ...);
+print("E:", LA_F("Push prflx candidate<%s:%d>...",        LA_F332, 332), ...);
+```
+
+下次运行 i18n.sh 时：
+1. 阶段 3 从 `cc -E` 输出中提取到三条记录，各不相同，但都带 `sid=332`
+2. 阶段 4 去重以字符串内容（key）为唯一标识——三个 key 不同，各自保留，且各自继承 `sid=332`
+3. 阶段 5 分配 SID 时，三条记录都声称自己是 SID 332，全部通过有效性检查
+4. 结果：`.LANG.c` 和 `LANG.cn.h` 中生成三行 `[LA_F332] = ...`，编译器报 `initializer-overrides` 警告
+
+**处理方式**：
+
+阶段 5 使用 `_sid_check` 函数维护一张 `SID → key` 的映射表（`TEMP_SID_OWNER` 临时文件）。
+分配 SID 时，如果该 SID 已被另一个不同的 key 占用，则自动分配新的 `SID_NEXT` 并输出 WARNING：
+
+```
+WARNING: SID 332 conflict — reassigning new SID
+  existing: Duplicate remote candidate<%s:%d> from signaling, skipped
+  conflict: Push prflx candidate<%s:%d> failed(OOM)
+```
+
+W、S、F 三个循环共享同一张映射表，确保跨类型也不会冲突。
+冲突的条目获得新 SID 后，阶段 6 回写会将源码中的旧 SID 替换为新值。
 
 ---
 
