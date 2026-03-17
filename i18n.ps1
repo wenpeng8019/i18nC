@@ -379,14 +379,22 @@ $markerContent = @'
 # ============================================================================
 
 function Invoke-Preprocessor {
-    param([string]$File, [hashtable]$CI, [bool]$IsHeader)
+    param(
+        [string]$File,
+        [hashtable]$CI,
+        [bool]$IsHeader,
+        # 指定目标源文件路径时，保留 #line 指令并过滤来自 inline header 的展开行。
+        # 为空时使用 -P / /EP（不保留 #line），适用于 Phase 0.5 探测。
+        [string]$FilterTarget = ""
+    )
 
     $tempWrapper = $null
     try {
         if ($CI.Type -eq "msvc") {
-            # MSVC: cl.exe /nologo /EP /FI"marker.h" [flags] source
-            # /EP  = 预处理到 stdout，不附加 #line 指令
-            # /FI  = 强制 include（等价于 -include）
+            # MSVC: cl.exe /nologo /FI"marker.h" [flags] source
+            # /EP = 预处理到 stdout，不附加 #line
+            # /E  = 预处理到 stdout，附加 #line
+            # /FI = 强制 include（等价于 -include）
             # .h 文件：用临时 .c 包装后预处理
             $srcFile = $File
             if ($IsHeader) {
@@ -395,19 +403,41 @@ function Invoke-Preprocessor {
                 [System.IO.File]::WriteAllText($tempWrapper, "#include `"$escaped`"`n")
                 $srcFile = $tempWrapper
             }
-            $result = & $CI.Cmd /nologo /EP "/FI$TempMarkerH" @($CI.Flags) $srcFile 2>&1
+            $ppFlag = if ($FilterTarget) { "/E" } else { "/EP" }
+            $result = & $CI.Cmd /nologo $ppFlag "/FI$TempMarkerH" @($CI.Flags) $srcFile 2>&1
             # cl.exe 错误会混在 stdout，过滤掉非代码行（以文件名开头的诊断行）
             $codeLines = $result | Where-Object { $_ -notmatch '^\s*$' -and $_ -notmatch '^[A-Za-z].*\(\d+\)\s*:' }
-            return $codeLines -join "`n"
         } else {
-            # GCC / Clang: -E -P -include marker.h [-x c] flags source
+            # GCC / Clang: -E [-P] -include marker.h [-x c] flags source
             $extraArgs = @()
             if ($IsHeader) { $extraArgs = @("-x", "c") }
-            $result = & $CI.Cmd -E -P -include $TempMarkerH @($extraArgs) @($CI.Flags) $File 2>&1
+            [string[]]$ppArgs = if ($FilterTarget) { ,@("-E") } else { ,@("-E", "-P") }
+            $result = & $CI.Cmd @ppArgs -include $TempMarkerH @($extraArgs) @($CI.Flags) $File 2>&1
             # 过滤 stderr 诊断，只保留预处理输出
             $codeLines = $result | Where-Object { $_ -is [string] }
-            return $codeLines -join "`n"
         }
+
+        if ($FilterTarget) {
+            # 解析 #line / # <line> "<file>" 指令，只保留属于目标文件的行，
+            # 过滤掉 #include 展开引入的 inline header 代码。
+            # 注意：MSVC .h 文件经 temp wrapper #include 引入时路径被转为正斜杠，
+            # 需要统一比较以避免 \ vs / 不匹配。
+            $filtered = [System.Collections.Generic.List[string]]::new()
+            $cur = ""
+            $targetNorm = $FilterTarget.Replace('\', '/')
+            foreach ($ln in $codeLines) {
+                if ($ln.StartsWith('#')) {
+                    $m = [regex]::Match($ln, '"([^"]+)"')
+                    if ($m.Success) { $cur = $m.Groups[1].Value }
+                    continue
+                }
+                if ($cur.Replace('\', '/') -eq $targetNorm -or $cur -eq "") {
+                    $filtered.Add($ln)
+                }
+            }
+            return $filtered -join "`n"
+        }
+        return $codeLines -join "`n"
     } finally {
         if ($tempWrapper) { Remove-Item $tempWrapper -ErrorAction SilentlyContinue }
     }
@@ -553,7 +583,7 @@ Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
         $ci = Get-CompilerFlagsForFile -FilePath $file
 
         try {
-            $preprocessed = Invoke-Preprocessor -File $file -CI $ci -IsHeader $isHeader
+            $preprocessed = Invoke-Preprocessor -File $file -CI $ci -IsHeader $isHeader -FilterTarget $file
             $extracted = Extract-Strings -Content $preprocessed -Base $base -SourcePath $file
             foreach ($r in $extracted) { $allResults.Add($r) }
 

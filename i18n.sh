@@ -616,8 +616,19 @@ find "$SOURCE_DIR" \( -name "*.c" -o -name "*.h" \) \
     # 捕获 cc -E 的 stderr；预处理失败时打印警告（不影响其余文件继续处理）
     _cc_err_tmp=$(mktemp)
     # shellcheck disable=SC2086
-    if ! $_cc_flags $_xflag -E -P -include "$_marker_h" "$file" \
+    # 注意：不使用 -P，保留 #line 指令，以便中间 awk 过滤来自 inline header 的展开
+    if ! $_cc_flags $_xflag -E -include "$_marker_h" "$file" \
             2>"$_cc_err_tmp" | \
+    awk -v target="$file" '
+        # 解析预处理器的 # <line> "<file>" 指令，只保留属于目标文件的行
+        /^#/ {
+            if (match($0, /"[^"]+"/) > 0) {
+                cur = substr($0, RSTART+1, RLENGTH-2)
+            }
+            next
+        }
+        cur == target || cur == "" { print }
+    ' | \
     awk -v base="$base" -v src="$file" -f "$_awk_extract"; then
         echo "Warning: preprocessing failed for $file" >&2
         [ "$DEBUG_MODE" -eq 1 ] && cat "$_cc_err_tmp" >&2
@@ -627,7 +638,7 @@ find "$SOURCE_DIR" \( -name "*.c" -o -name "*.h" \) \
     # Phase 0.5: 处理 #define 中的 LA_ 调用
     # 支持多行续行（以 \ 结尾的行会与后续行合并）
     # 用 awk 合并续行后检测是否包含 LA_C?[WSF]
-    _probe_tmp=$(mktemp /tmp/i18n_probe_XXXXXX.c)
+    _probe_tmp=$(mktemp /tmp/i18n_probe_XXXXXX)
     _abs_file=$(cd "$(dirname "$file")" && pwd)/$(basename "$file")
     # 转义 C 字符串特殊字符：\ → \\, " → \"
     _escaped_file=$(printf '%s' "$_abs_file" | sed 's/\\/\\\\/g; s/"/\\"/g')
