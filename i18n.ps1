@@ -1357,6 +1357,25 @@ Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
                             if (-not $typeOccScan.ContainsKey($st)) { $typeOccScan[$st] = 0 }
                             $typeOccScan[$st]++
                             if (-not $lineMapRef.ContainsKey("$file|$lineNo|$st|$($typeOccScan[$st])")) {
+                                # 括号平衡检测：若调用在本行已关闭，是未激活 #ifdef 分支中的完整调用
+                                # 不设 pending，否则会误触发后续行替换
+                                $callOpenPos = $sm.Index + $sm.Length - 1  # position of `(`
+                                $bc = 1; $bk = $callOpenPos + 1; $lnStr = $lines[$idx]
+                                while ($bk -lt $lnStr.Length -and $bc -gt 0) {
+                                    $bch = $lnStr[$bk]
+                                    if ($bch -eq [char]'"') {
+                                        $bk++
+                                        while ($bk -lt $lnStr.Length) {
+                                            $bs = $lnStr[$bk]
+                                            if ($bs -eq [char]'\') { $bk += 2 }
+                                            elseif ($bs -eq [char]'"') { $bk++; break }
+                                            else { $bk++ }
+                                        }
+                                    } elseif ($bch -eq [char]'(') { $bc++; $bk++ }
+                                    elseif ($bch -eq [char]')') { $bc--; $bk++ }
+                                    else { $bk++ }
+                                }
+                                if ($bc -eq 0) { continue }  # 调用已关闭 — 未激活分支，跳过
                                 $ppending = $true; $ppendingType = $st; $ppendingOcc = $typeOccScan[$st]; break
                             }
                         }

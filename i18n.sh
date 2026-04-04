@@ -1589,7 +1589,29 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                             new_id = mapn[mapk]
                             new_sid = mapsid[mapk]
                             if (new_id == "") {
-                                # 可能是多行调用且 __LINE__ 在后面的续行 — 记录 pending
+                                # 括号平衡检测：若 LA_X( 调用在本行已关闭（平衡=0），说明是
+                                # 未激活的 #ifdef 分支中的完整调用，不设 pending（否则会
+                                # 误触发后续行替换）；只有调用跨行时才设置 pending。
+                                _bc = 1; _bk = j + 1
+                                while (_bk <= L && _bc > 0) {
+                                    _bch = substr(line, _bk, 1)
+                                    if (_bch == "\"") {
+                                        _bk++
+                                        while (_bk <= L) {
+                                            _bs = substr(line, _bk, 1)
+                                            if (_bs == "\\") _bk += 2
+                                            else if (_bs == "\"") { _bk++; break }
+                                            else _bk++
+                                        }
+                                    } else if (_bch == "(") { _bc++; _bk++ }
+                                    else if (_bch == ")") { _bc--; _bk++ }
+                                    else _bk++
+                                }
+                                if (_bc == 0) {
+                                    # 调用在本行关闭 — 未激活分支，直接复制，不设 pending
+                                    result = result substr(line,i,1); i++; continue
+                                }
+                                # 多行调用 — 设置 pending
                                 _ppending = 1; _ptype = t; _pocc = type_occ[t]
                                 result = result substr(line,i,1)
                                 i++
