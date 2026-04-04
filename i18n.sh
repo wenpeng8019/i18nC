@@ -929,10 +929,10 @@ if [ "$format_count" -gt 0 ]; then
         fi
         [ -z "$first_fmt_id" ] && first_fmt_id="$id_name"
         params=$(printf '%s' "$str" | grep -o '%[sdifuxXclu]' 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)
-        # 如果 LA_F 字符串不包含 % 则添加 "% " 前缀（让 print() 直接输出）
-        str_out=$(_fmt_ensure_prefix "$str")
         printf 'F|%s|%s|%s\n' "$key" "$id_name" "$entry_sid" >> "$TEMP_MAP"
-        printf 'F|%s|%s|%s|%s|%s\n' "$id_name" "$entry_sid" "$str_out" "$files_formatted" "$params" >> "$TEMP_ENUM_DATA"
+        # TEMP_ENUM_DATA 存原始字符串（不含自动添加的 % 前缀），.LANG.h 注释保持与源码一致
+        # .LANG.c 在写入时再调用 _fmt_ensure_prefix 添加前缀
+        printf 'F|%s|%s|%s|%s|%s\n' "$id_name" "$entry_sid" "$str" "$files_formatted" "$params" >> "$TEMP_ENUM_DATA"
         [ "$entry_sid" -gt "$max_sid" ] && max_sid=$entry_sid
         sid=$((sid + 1))
     done < "$TEMP_FORMATS"
@@ -1003,7 +1003,7 @@ fi
 
 cat > "$OUTPUT_H" <<'EOF'
 /*
- * 自动生成的语言 ID 枚举（由 i18n.sh 生成）
+ * 自动生成的语言 ID 枚举（由 i18n 工具生成）
  *
  * 除「remove 操作」外请勿手动编辑，重新生成会覆盖所有改动。
  *
@@ -1024,7 +1024,7 @@ cat > "$OUTPUT_H" <<'EOF'
  *
  * 操作说明:
  *   若在枚举注释中看到 "disabled" 前缀，且确认该字符串不再需要，
- *   将注释中的 "disabled" 改为 "remove"，然后重新运行 i18n.sh 即可。
+ *   将注释中的 "disabled" 改为 "remove"，然后重新运行 i18n 工具即可。
  *   示例:
  *     LA_F99,  // disabled "some old string"
  *     改为:
