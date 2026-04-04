@@ -1296,21 +1296,85 @@ Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
         $file = $_.FullName
         try {
             $lines = [System.IO.File]::ReadAllLines($file, [System.Text.Encoding]::UTF8)
+            # Apple Clang 展开 __LINE__ 为多行宏调用的最后一行（含 , 0, 0 的那行），
+            # 而非 LA_S( 所在行。用 pending 状态机：在 LA_S( 行检测到 map 中无该行条目时
+            # 记录 pending，在找到对应 map 行时对该行执行替换。（与 i18n.sh awk 逻辑对应）
+            $ppending = $false; $ppendingType = ""; $ppendingOcc = 0
             for ($idx = 0; $idx -lt $lines.Count; $idx++) {
                 $lineNo = $idx + 1
-                $typeOcc = @{}
-                $lines[$idx] = $reMacro.Replace($lines[$idx], [System.Text.RegularExpressions.MatchEvaluator]{
-                    param($m)
-                    $t = $m.Groups[1].Value
-                    if ($t -match 'LA_C?([WSF])') { $t = $Matches[1] } else { return $m.Value }
-                    if (-not $typeOcc.ContainsKey($t)) { $typeOcc[$t] = 0 }
-                    $typeOcc[$t] = [int]$typeOcc[$t] + 1
-                    $lk = "$file|$lineNo|$t|$($typeOcc[$t])"
-                    if (-not $lineMapRef.ContainsKey($lk)) { return $m.Value }
-                    $v = $lineMapRef[$lk] -split '\|', 2
-                    if ($v.Count -lt 2) { return $m.Value }
-                    return "$($m.Groups[1].Value)$($v[0]), $($v[1])"
-                })
+                $handledByPending = $false
+                # ── 多行宏续行处理 ─────────────────────────────────────────────
+                if ($ppending) {
+                    $pmk = "$file|$lineNo|$ppendingType|$ppendingOcc"
+                    if ($lineMapRef.ContainsKey($pmk)) {
+                        $pv = $lineMapRef[$pmk] -split '\|', 2
+                        if ($pv.Count -ge 2) {
+                            $pni = $pv[0]; $pns = $pv[1]
+                            # 逐字符扫描：跳过字符串字面量，在第一个逗号处替换旧 ID+SID
+                            $ln = $lines[$idx]; $res = ""; $pp = 0; $pdone = $false
+                            while ($pp -lt $ln.Length) {
+                                $ch = $ln[$pp]
+                                if ($ch -eq [char]'"') {
+                                    $res += $ch; $pp++
+                                    while ($pp -lt $ln.Length) {
+                                        $ch2 = $ln[$pp]
+                                        if ($ch2 -eq [char]'\') { $res += "$ch2$($ln[$pp+1])"; $pp += 2 }
+                                        elseif ($ch2 -eq [char]'"') { $res += $ch2; $pp++; break }
+                                        else { $res += $ch2; $pp++ }
+                                    }
+                                } elseif (-not $pdone -and $ch -eq [char]',') {
+                                    $res += $ch; $pp++
+                                    while ($pp -lt $ln.Length -and ($ln[$pp] -eq [char]' ' -or $ln[$pp] -eq [char]"`t")) { $res += $ln[$pp]; $pp++ }
+                                    while ($pp -lt $ln.Length -and ([char]::IsLetterOrDigit($ln[$pp]) -or $ln[$pp] -eq [char]'_')) { $pp++ }
+                                    $res += $pni
+                                    if ($pns -ne '') {
+                                        $res += ", $pns"
+                                        $pk2 = $pp
+                                        while ($pk2 -lt $ln.Length -and ($ln[$pk2] -eq [char]' ' -or $ln[$pk2] -eq [char]"`t")) { $pk2++ }
+                                        if ($pk2 -lt $ln.Length -and $ln[$pk2] -eq [char]',') {
+                                            $pk3 = $pk2 + 1
+                                            while ($pk3 -lt $ln.Length -and ($ln[$pk3] -eq [char]' ' -or $ln[$pk3] -eq [char]"`t")) { $pk3++ }
+                                            if ($pk3 -lt $ln.Length -and [char]::IsDigit($ln[$pk3])) {
+                                                while ($pk3 -lt $ln.Length -and [char]::IsDigit($ln[$pk3])) { $pk3++ }
+                                                $pp = $pk3
+                                            }
+                                        }
+                                    }
+                                    $pdone = $true
+                                } else { $res += $ch; $pp++ }
+                            }
+                            $lines[$idx] = $res; $ppending = $false; $handledByPending = $true
+                        }
+                    }
+                }
+                if (-not $handledByPending) {
+                    # 扫描该行是否有 LA_C?[WSF]( 且 map 中无对应条目（多行调用起始行）
+                    if (-not $ppending) {
+                        $scanPat = [regex]'LA_C?([WSF])\s*\('
+                        $typeOccScan = @{}
+                        foreach ($sm in $scanPat.Matches($lines[$idx])) {
+                            $st = $sm.Groups[1].Value
+                            if (-not $typeOccScan.ContainsKey($st)) { $typeOccScan[$st] = 0 }
+                            $typeOccScan[$st]++
+                            if (-not $lineMapRef.ContainsKey("$file|$lineNo|$st|$($typeOccScan[$st])")) {
+                                $ppending = $true; $ppendingType = $st; $ppendingOcc = $typeOccScan[$st]; break
+                            }
+                        }
+                    }
+                    $typeOcc = @{}
+                    $lines[$idx] = $reMacro.Replace($lines[$idx], [System.Text.RegularExpressions.MatchEvaluator]{
+                        param($m)
+                        $t = $m.Groups[1].Value
+                        if ($t -match 'LA_C?([WSF])') { $t = $Matches[1] } else { return $m.Value }
+                        if (-not $typeOcc.ContainsKey($t)) { $typeOcc[$t] = 0 }
+                        $typeOcc[$t] = [int]$typeOcc[$t] + 1
+                        $lk = "$file|$lineNo|$t|$($typeOcc[$t])"
+                        if (-not $lineMapRef.ContainsKey($lk)) { return $m.Value }
+                        $v = $lineMapRef[$lk] -split '\|', 2
+                        if ($v.Count -lt 2) { return $m.Value }
+                        return "$($m.Groups[1].Value)$($v[0]), $($v[1])"
+                    })
+                }
             }
 
             [System.IO.File]::WriteAllLines($file, $lines, [System.Text.UTF8Encoding]::new($false))
