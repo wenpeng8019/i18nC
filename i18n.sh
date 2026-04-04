@@ -1517,10 +1517,57 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                 }
             }
             close(mapfile)
+            _ppending = 0; _ptype = ""; _pocc = 0
         }
         {
             line = $0; result = ""; i = 1; L = length(line)
             delete type_occ
+            # ── 多行宏续行处理 ──────────────────────────────────────────────────
+            # Apple Clang 中 __LINE__ 展开为多行调用的最后一行（如 LA_S(..N行.., 0, 0) 中
+            # 0, 0 所在行），所以 map 条目在最后一行，而非 LA_S( 所在行。
+            # 当 LA_S( 所在行 new_id=="" 时记录 pending；到达含 map 条目的续行时在这里替换。
+            if (_ppending) {
+                _pmk = curfile SUBSEP FNR SUBSEP _ptype SUBSEP _pocc
+                if (mapn[_pmk] != "") {
+                    _pni = mapn[_pmk]; _pns = mapsid[_pmk]; _ppending = 0
+                    _pr = ""; _pp = 1; _pdone = 0
+                    while (_pp <= L) {
+                        _pc = substr(line, _pp, 1)
+                        if (_pc == "\"") {
+                            _pr = _pr _pc; _pp++
+                            while (_pp <= L) {
+                                _ps = substr(line, _pp, 1)
+                                if (_ps == "\\") { _pr = _pr _ps substr(line,_pp+1,1); _pp += 2 }
+                                else if (_ps == "\"") { _pr = _pr _ps; _pp++; break }
+                                else { _pr = _pr _ps; _pp++ }
+                            }
+                            continue
+                        }
+                        if (!_pdone && _pc == ",") {
+                            _pr = _pr _pc; _pp++
+                            while (_pp <= L && substr(line,_pp,1) ~ /[ \t]/) { _pr = _pr substr(line,_pp,1); _pp++ }
+                            while (_pp <= L && substr(line,_pp,1) ~ /[A-Za-z0-9_]/) _pp++
+                            _pr = _pr _pni
+                            if (_pns != "") {
+                                _pr = _pr ", " _pns
+                                _pk2 = _pp
+                                while (_pk2 <= L && substr(line,_pk2,1) ~ /[ \t]/) _pk2++
+                                if (_pk2 <= L && substr(line,_pk2,1) == ",") {
+                                    _pk3 = _pk2+1
+                                    while (_pk3 <= L && substr(line,_pk3,1) ~ /[ \t]/) _pk3++
+                                    if (_pk3 <= L && substr(line,_pk3,1) ~ /[0-9]/) {
+                                        while (_pk3 <= L && substr(line,_pk3,1) ~ /[0-9]/) _pk3++
+                                        _pp = _pk3
+                                    }
+                                }
+                            }
+                            _pdone = 1; continue
+                        }
+                        _pr = _pr _pc; _pp++
+                    }
+                    print _pr; next
+                }
+            }
             while (i <= L) {
                 if (substr(line,i,3) == "LA_") {
                     t = substr(line,i+3,1)
@@ -1542,10 +1589,13 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                             new_id = mapn[mapk]
                             new_sid = mapsid[mapk]
                             if (new_id == "") {
+                                # 可能是多行调用且 __LINE__ 在后面的续行 — 记录 pending
+                                _ppending = 1; _ptype = t; _pocc = type_occ[t]
                                 result = result substr(line,i,1)
                                 i++
                                 continue
                             }
+                            _ppending = 0  # clear pending: found map entry for this call
                             j++
                             while (j <= L && substr(line,j,1) ~ /[ \t]/) j++
                             # Skip optional unicode string prefix: u" L" U" u8"
