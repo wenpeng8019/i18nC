@@ -1325,7 +1325,13 @@ Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
                                 } elseif (-not $pdone -and $ch -eq [char]',') {
                                     $res += $ch; $pp++
                                     while ($pp -lt $ln.Length -and ($ln[$pp] -eq [char]' ' -or $ln[$pp] -eq [char]"`t")) { $res += $ln[$pp]; $pp++ }
+                                    $oldIdStart = $pp
                                     while ($pp -lt $ln.Length -and ([char]::IsLetterOrDigit($ln[$pp]) -or $ln[$pp] -eq [char]'_')) { $pp++ }
+                                    # 如果旧 ID 位置是非标识符（如字符串 "..."），跳过不替换
+                                    if ($pp -eq $oldIdStart) {
+                                        $res += $ln[$oldIdStart]; $pp = $oldIdStart + 1
+                                        continue
+                                    }
                                     $res += $pni
                                     if ($pns -ne '') {
                                         $res += ", $pns"
@@ -1334,8 +1340,9 @@ Get-ChildItem -Path $SourceDir -Recurse -File -Include @("*.c","*.h") |
                                         if ($pk2 -lt $ln.Length -and $ln[$pk2] -eq [char]',') {
                                             $pk3 = $pk2 + 1
                                             while ($pk3 -lt $ln.Length -and ($ln[$pk3] -eq [char]' ' -or $ln[$pk3] -eq [char]"`t")) { $pk3++ }
-                                            if ($pk3 -lt $ln.Length -and [char]::IsDigit($ln[$pk3])) {
-                                                while ($pk3 -lt $ln.Length -and [char]::IsDigit($ln[$pk3])) { $pk3++ }
+                                            # 跳过数字或标识符（LA_Fxxx）
+                                            if ($pk3 -lt $ln.Length -and ([char]::IsLetterOrDigit($ln[$pk3]) -or $ln[$pk3] -eq [char]'_')) {
+                                                while ($pk3 -lt $ln.Length -and ([char]::IsLetterOrDigit($ln[$pk3]) -or $ln[$pk3] -eq [char]'_')) { $pk3++ }
                                                 $pp = $pk3
                                             }
                                         }

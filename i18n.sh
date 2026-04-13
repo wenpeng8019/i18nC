@@ -1646,6 +1646,12 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                                         while (k <= L && substr(line,k,1) ~ /[ \t]/) k++
                                         id0 = k
                                         while (k <= L && substr(line,k,1) ~ /[A-Za-z0-9_]/) k++
+                                        # 如果旧 ID 位置是非标识符（如字符串 "..."），跳过不替换
+                                        if (id0 == k) {
+                                            result = result substr(line,i,1)
+                                            i++
+                                            continue
+                                        }
                                         if (new_id == "") {
                                             result = result substr(line,i,1)
                                             i++
@@ -1654,14 +1660,15 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                                         result = result substr(line,i,id0-i) new_id
                                         if (new_sid != "") {
                                             result = result ", " new_sid
-                                            # skip existing numeric 3rd arg if present
+                                            # skip existing 3rd arg if present (numeric or LA_Fxxx)
                                             k2 = k
                                             while (k2 <= L && substr(line,k2,1) ~ /[ \t]/) k2++
                                             if (k2 <= L && substr(line,k2,1) == ",") {
                                                 k3 = k2+1
                                                 while (k3 <= L && substr(line,k3,1) ~ /[ \t]/) k3++
-                                                if (k3 <= L && substr(line,k3,1) ~ /[0-9]/) {
-                                                    while (k3 <= L && substr(line,k3,1) ~ /[0-9]/) k3++
+                                                # 跳过数字或标识符（LA_Fxxx）
+                                                if (k3 <= L && substr(line,k3,1) ~ /[0-9A-Za-z_]/) {
+                                                    while (k3 <= L && substr(line,k3,1) ~ /[0-9A-Za-z_]/) k3++
                                                     k = k3
                                                 }
                                             }
@@ -1709,6 +1716,12 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                                         while (k <= L && substr(line,k,1) ~ /[ \t]/) k++
                                         id0 = k
                                         while (k <= L && substr(line,k,1) ~ /[A-Za-z0-9_]/) k++
+                                        # 如果旧 ID 位置是非标识符（如字符串 "..."），跳过不替换
+                                        if (id0 == k) {
+                                            result = result substr(line,i,1)
+                                            i++
+                                            continue
+                                        }
                                         if (new_id == "") {
                                             result = result substr(line,i,1)
                                             i++
@@ -1717,14 +1730,15 @@ find "$SOURCE_DIR" -name "*.c" -o -name "*.h" | while read -r file; do
                                         result = result substr(line,i,id0-i) new_id
                                         if (new_sid != "") {
                                             result = result ", " new_sid
-                                            # skip existing numeric 3rd arg if present
+                                            # skip existing 3rd arg if present (numeric or LA_Fxxx)
                                             k2 = k
                                             while (k2 <= L && substr(line,k2,1) ~ /[ \t]/) k2++
                                             if (k2 <= L && substr(line,k2,1) == ",") {
                                                 k3 = k2+1
                                                 while (k3 <= L && substr(line,k3,1) ~ /[ \t]/) k3++
-                                                if (k3 <= L && substr(line,k3,1) ~ /[0-9]/) {
-                                                    while (k3 <= L && substr(line,k3,1) ~ /[0-9]/) k3++
+                                                # 跳过数字或标识符（LA_Fxxx）
+                                                if (k3 <= L && substr(line,k3,1) ~ /[0-9A-Za-z_]/) {
+                                                    while (k3 <= L && substr(line,k3,1) ~ /[0-9A-Za-z_]/) k3++
                                                     k = k3
                                                 }
                                             }
